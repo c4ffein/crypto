@@ -7,6 +7,11 @@ WARNING: I don't recommand using this as-is. This a PoC, and usable by me becaus
 - You can use it if you feel that you can edit the code yourself and you can live with my future breaking changes.
 """
 
+from enum import Enum
+
+colors = {"RED": "31", "GREEN": "32", "PURP": "34", "DIM": "90", "WHITE": "39"}
+Color = Enum("Color", [(k, f"\033[{v}m") for k, v in colors.items()])
+
 
 class CryptoCliException(Exception):
     pass
