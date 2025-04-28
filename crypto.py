@@ -13,7 +13,7 @@ class CryptoCliException(Exception):
 
 
 def main():
-    return -4  # TODO
+    raise CryptoCliException("WiP I guess")
 
 
 if __name__ == "__main__":
