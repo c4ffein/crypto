@@ -17,8 +17,34 @@ class CryptoCliException(Exception):
     pass
 
 
+def usage():
+    output_lines = [
+        "crypto - crypto tools",
+        "=======================",
+        "- crypto host-check hostname[:port] ==> check the TLS certificate of a remote server",
+    ]
+    print("\n" + "\n".join(output_lines) + "\n")
+    return -1
+
+
+def consume_args():
+    if len(argv) < 2 or argv[1] not in ["host-check"]:
+        return None
+    if argv[1] == "host-check":
+        if len(argv) != 3:
+            return None
+        return {"action": "host-check", "target": argv[1]}
+    return None
+
+
 def main():
-    raise CryptoCliException("WiP I guess")
+    args = consume_args()
+    if not args:
+        return usage()
+    if args["action"] == "host-check":
+        raise CryptoCliException("WiP I guess")
+    else:
+        return usage()
 
 
 if __name__ == "__main__":
