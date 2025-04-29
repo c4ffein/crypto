@@ -8,6 +8,7 @@ WARNING: I don't recommand using this as-is. This a PoC, and usable by me becaus
 """
 
 from enum import Enum
+from sys import argv
 
 colors = {"RED": "31", "GREEN": "32", "PURP": "34", "DIM": "90", "WHITE": "39"}
 Color = Enum("Color", [(k, f"\033[{v}m") for k, v in colors.items()])
