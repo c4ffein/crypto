@@ -10,6 +10,12 @@ WARNING: I don't recommand using this as-is. This a PoC, and usable by me becaus
 from enum import Enum
 from sys import argv
 
+# TODO Verify the whole chain is secure
+# TODO Don't save anything in the current directory but a common dir instead
+
+MAX_DEPTH = 4  # TODO Parameterize
+TIMEOUT = 4  # TODO Parameterize
+
 colors = {"RED": "31", "GREEN": "32", "PURP": "34", "DIM": "90", "WHITE": "39"}
 Color = Enum("Color", [(k, f"\033[{v}m") for k, v in colors.items()])
 
@@ -26,6 +32,20 @@ def get_bytes_from_url(url: str) -> Optional[bytes]:
     except HTTPError, RequestException as exc:
         raise CryptoCliException(f"Unable to reach {url}") from exc
     return response.content
+
+
+def write_to_file(obj: Any, filename: str) -> None:
+    try:
+        filename = f"TEMPFILES/{filename}"  # TODO better
+        mode = "wb" if isinstance(obj, bytes) else "w"
+        with open(filename, mode) as file:
+            file.write(str(obj) if not isinstance(obj, bytes) else obj)
+    except IOError, TypeError as exc:
+        CryptoCliException(f"Failed to write to file {filename}") from exc
+
+
+def get_certificate_from_url(url: str) -> X509_Certificate:
+    return load_pem_x509_certificate(DER_cert_to_PEM_cert(get_bytes_from_url(url)).encode("ascii"))
 
 
 def get_ca_cert_pem() -> None:  # TODO Specify a better location
