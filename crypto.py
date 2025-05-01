@@ -18,6 +18,20 @@ class CryptoCliException(Exception):
     pass
 
 
+def get_bytes_from_url(url: str) -> Optional[bytes]:
+    try:
+        response = requests.get(url)
+        if response.status_code != 200:
+            response.raise_for_status()
+    except HTTPError, RequestException as exc:
+        raise CryptoCliException(f"Unable to reach {url}") from exc
+    return response.content
+
+
+def get_ca_cert_pem() -> None:  # TODO Specify a better location
+    write_to_file(get_bytes_from_url("https://curl.se/ca/cacert.pem"), "cacert.pem")
+
+
 def usage():
     output_lines = [
         "crypto - crypto tools",
