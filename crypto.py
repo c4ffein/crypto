@@ -29,7 +29,7 @@ def get_bytes_from_url(url: str) -> Optional[bytes]:
         response = requests.get(url)
         if response.status_code != 200:
             response.raise_for_status()
-    except HTTPError, RequestException as exc:
+    except (HTTPError, RequestException) as exc:
         raise CryptoCliException(f"Unable to reach {url}") from exc
     return response.content
 
@@ -40,7 +40,7 @@ def write_to_file(obj: Any, filename: str) -> None:
         mode = "wb" if isinstance(obj, bytes) else "w"
         with open(filename, mode) as file:
             file.write(str(obj) if not isinstance(obj, bytes) else obj)
-    except IOError, TypeError as exc:
+    except (IOError, TypeError) as exc:
         CryptoCliException(f"Failed to write to file {filename}") from exc
 
 
