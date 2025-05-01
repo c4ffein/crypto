@@ -41,7 +41,7 @@ def write_to_file(obj: Any, filename: str) -> None:
         with open(filename, mode) as file:
             file.write(str(obj) if not isinstance(obj, bytes) else obj)
     except (IOError, TypeError) as exc:
-        CryptoCliException(f"Failed to write to file {filename}") from exc
+        raise CryptoCliException(f"Failed to write to file {filename}") from exc
 
 
 def get_certificate_from_url(url: str) -> X509_Certificate:
