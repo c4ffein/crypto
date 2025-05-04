@@ -52,6 +52,36 @@ def get_ca_cert_pem() -> None:  # TODO Specify a better location
     write_to_file(get_bytes_from_url("https://curl.se/ca/cacert.pem"), "cacert.pem")
 
 
+def get_hostname_and_port(host):
+    try:
+        host_port = host.split(":") if ":" in host else (host, 443)
+        if len(host_port) != 2:
+            raise Exception
+        return host_port[0], int(host_port[1])
+    except:
+        raise CryptoCliException(f"Unable to parse host: {host}")
+
+
+def get_certificate_from_hostname_and_port(
+    hostname, port, secure: bool = True, timeout: Optional[int] = None
+) -> X509_Certificate:
+    try:
+        sock = create_socket(AF_INET, SOCK_STREAM)
+        if timeout:
+            sock.settimeout(timeout)
+        wrapped_socket = create_default_context().wrap_socket(sock, server_hostname=hostname)
+        wrapped_socket.connect((hostname, port))
+        der_cert_bin = wrapped_socket.getpeercert(True)
+        sha256 = sha256_hasher(der_cert_bin).hexdigest()
+        print(f"SHA256: {sha256}")  # TODO Print in a better way?
+        ssl_certificate = DER_cert_to_PEM_cert(der_cert_bin)
+        return load_pem_x509_certificate(ssl_certificate.encode("ascii"))
+    except SSLCertVerificationError as exc:
+        raise CryptoCliException(f"Cert verification error: {hostname}:{port}") from exc
+    except ConnectionRefusedError as exc:
+        raise CryptoCliException(f"Connection refused: {hostname}:{port}") from exc
+
+
 def usage():
     output_lines = [
         "crypto - crypto tools",
