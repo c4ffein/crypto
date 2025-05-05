@@ -7,6 +7,8 @@ WARNING: I don't recommand using this as-is. This a PoC, and usable by me becaus
 - You can use it if you feel that you can edit the code yourself and you can live with my future breaking changes.
 """
 
+from cryptography.x509 import Certificate as X509Certificate
+from cryptography.x509.oid import ObjectIdentifier
 from enum import Enum
 from sys import argv
 
@@ -44,7 +46,7 @@ def write_to_file(obj: Any, filename: str) -> None:
         raise CryptoCliException(f"Failed to write to file {filename}") from exc
 
 
-def get_certificate_from_url(url: str) -> X509_Certificate:
+def get_certificate_from_url(url: str) -> X509Certificate:
     return load_pem_x509_certificate(DER_cert_to_PEM_cert(get_bytes_from_url(url)).encode("ascii"))
 
 
@@ -64,7 +66,7 @@ def get_hostname_and_port(host):
 
 def get_certificate_from_hostname_and_port(
     hostname, port, secure: bool = True, timeout: Optional[int] = None
-) -> X509_Certificate:
+) -> X509Certificate:
     try:
         sock = create_socket(AF_INET, SOCK_STREAM)
         if timeout:
@@ -80,6 +82,15 @@ def get_certificate_from_hostname_and_port(
         raise CryptoCliException(f"Cert verification error: {hostname}:{port}") from exc
     except ConnectionRefusedError as exc:
         raise CryptoCliException(f"Connection refused: {hostname}:{port}") from exc
+
+
+def get_cert_extension_or_none(
+    ssl_certificate: X509Certificate, object_identifier: ObjectIdentifier
+) -> Optional[X509Extension]:
+    try:
+        return ssl_certificate.extensions.get_extension_for_oid(object_identifier)
+    except X509ExtensionNotFound:
+        return None
 
 
 def usage():
