@@ -87,6 +87,10 @@ def get_certificate_from_hostname_and_port(
 def get_cert_extension_or_none(
     ssl_certificate: X509Certificate, object_identifier: ObjectIdentifier
 ) -> Optional[X509Extension]:
+    """
+    The get_extension_for_oid doesn't handle the edge case where a certificate would have multiple AIA extensions
+    Section 4.2 of RFC 5280 => "A certificate MUST NOT include more than one instance of a particular extension."
+    """
     try:
         return ssl_certificate.extensions.get_extension_for_oid(object_identifier)
     except X509ExtensionNotFound:
