@@ -101,19 +101,35 @@ def usage():
     output_lines = [
         "crypto - crypto tools",
         "=======================",
-        "- crypto host-check hostname[:port] ==> check the TLS certificate of a remote server",
+        "- crypto host-check hostname[:port]               ==> check the TLS certificate of a remote server",
+        "- crypto host-check hostname[:port] insecure=True ==> same but allows insecure connections",
+        "- crypto get-cacert                               ==> get cacert.pem from curl.se, used to select a root CA",
     ]
     print("\n" + "\n".join(output_lines) + "\n")
     return -1
 
 
 def consume_args():
-    if len(argv) < 2 or argv[1] not in ["host-check"]:
+    if len(argv) < 2 or argv[1] not in ["host-check", "get-cacert"]:
         return None
     if argv[1] == "host-check":
-        if len(argv) != 3:
+        if len(argv) not in [3, 4]:
             return None
-        return {"action": "host-check", "target": argv[1]}
+        if len(argv) == 3:
+            return {"action": "host-check", "target": argv[2], "insecure": False}
+        if not any(argv[x].startswith("insecure=") for x in [2, 3]):
+            return None
+        return (
+            lambda a, b: (
+                {"action": "host-check", "target": argv[a], "insecure": argv[b][9:].upper() == "TRUE"}
+                if argv[b][9:].upper() in ["TRUE", "FALSE"]
+                else None
+            )
+        )(*((2, 3) if argv[3].startswith("insecure=") else (3, 2)))
+    if argv[1] == "get-cacert":
+        if len(argv) != 2:
+            return None
+        return {"action": "get-cacert"}
     return None
 
 
@@ -121,6 +137,8 @@ def main():
     args = consume_args()
     if not args:
         return usage()
+    if args["action"] == "get-cacert":
+        return get_ca_cert_pem()
     if args["action"] == "host-check":
         raise CryptoCliException("WiP I guess")
     else:
