@@ -20,6 +20,8 @@ from socket import AF_INET, SOCK_STREAM
 from socket import socket as create_socket
 from ssl import create_default_context, DER_cert_to_PEM_cert, SSLCertVerificationError
 from sys import argv
+from urllib.request import urlopen
+from urllib.request import URLError
 
 
 # TODO Verify the whole chain is secure
@@ -38,12 +40,13 @@ class CryptoCliException(Exception):
 
 def get_bytes_from_url(url: str) -> Optional[bytes]:
     try:
-        response = get_url(url)
-        if response.status_code != 200:
-            response.raise_for_status()
-    except (HTTPError, RequestException) as exc:
+        response = urlopen(url)
+        data = response.read()
+    except URLError as e:
         raise CryptoCliException(f"Unable to reach {url}") from exc
-    return response.content
+    if response.status != 200:
+        raise CryptoCliException(f"Unable to reach {url}") from exc
+    return data
 
 
 def write_to_file(obj: Any, filename: str) -> None:
