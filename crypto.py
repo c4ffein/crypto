@@ -109,9 +109,9 @@ def load_cacerts(filename: str) -> dict[str, str]:
         raise CryptoCliException("cacert.pem could not be parsed")
     if any(not lines[i - 1].startswith("=====") for i in begins):
         raise CryptoCliException("cacert.pem could not be parsed")
-    r = {lines[b - 2]: "\n".join(lines[i] for i in range(b, e + 1)) + "\n" for b, e in zip(begins, ends)}
-    print(f"{len(r)} roots found in cacert.pem")
-    return r
+    certs = {lines[b - 2]: "\n".join(lines[i] for i in range(b, e + 1)) + "\n" for b, e in zip(begins, ends)}
+    print(f"{len(certs)} roots found in cacert.pem")
+    return {name: load_pem_x509_certificate(cert.encode()) for name, cert in certs.items()}
 
 
 def usage():
