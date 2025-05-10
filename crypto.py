@@ -97,10 +97,27 @@ def get_cert_extension_or_none(
         return None
 
 
+def load_cacerts(filename: str) -> dict[str, str]:
+    try:
+        with open(filename, "r") as file:
+            lines = [l.strip("\n").strip("\r") for l in file.readlines()]
+    except FileNotFoundError as exc:
+        raise CryptoCliException(f"cacert.pem not found: get it with the get-cacert verb") from exc
+    begins = [i for i, l in enumerate(lines) if l.startswith(f"-----BEGIN CERTIFICATE-----")]
+    ends = [i for i, l in enumerate(lines) if l.startswith(f"-----END CERTIFICATE-----")]
+    if len(begins) != len(ends) or begins[0] < 2 or any(a >= b for a, b in zip(begins, ends)):
+        raise CryptoCliException("cacert.pem could not be parsed")
+    if any(not lines[i - 1].startswith("=====") for i in begins):
+        raise CryptoCliException("cacert.pem could not be parsed")
+    r = {lines[b - 2]: "\n".join(lines[i] for i in range(b, e + 1)) + "\n" for b, e in zip(begins, ends)}
+    print(f"{len(r)} roots found in cacert.pem")
+
+
 def usage():
     output_lines = [
         "crypto - crypto tools",
-        "=======================",
+        "WARNING - NO CHAIN VERIFICATION FOR NOW",  # TODO fix and remove this warning
+        "=====================",
         "- crypto host-check hostname[:port]               ==> check the TLS certificate of a remote server",
         "- crypto host-check hostname[:port] insecure=True ==> same but allows insecure connections",
         "- crypto get-cacert                               ==> get cacert.pem from curl.se, used to select a root CA",
