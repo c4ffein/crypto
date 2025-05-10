@@ -111,6 +111,7 @@ def load_cacerts(filename: str) -> dict[str, str]:
         raise CryptoCliException("cacert.pem could not be parsed")
     r = {lines[b - 2]: "\n".join(lines[i] for i in range(b, e + 1)) + "\n" for b, e in zip(begins, ends)}
     print(f"{len(r)} roots found in cacert.pem")
+    return r
 
 
 def usage():
