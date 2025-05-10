@@ -7,10 +7,20 @@ WARNING: I don't recommand using this as-is. This a PoC, and usable by me becaus
 - You can use it if you feel that you can edit the code yourself and you can live with my future breaking changes.
 """
 
+from cryptography.x509 import load_pem_x509_certificate
 from cryptography.x509 import Certificate as X509Certificate
-from cryptography.x509.oid import ObjectIdentifier
+from cryptography.x509 import ExtensionNotFound as X509ExtensionNotFound
+from cryptography.x509.extensions import Extension as X509Extension
+from cryptography.x509.oid import ObjectIdentifier, ExtensionOID
 from enum import Enum
+from hashlib import sha256 as sha256_hasher
+from requests import get as get_url  # TODO REPLACE
+from typing import Any, Optional
+from socket import AF_INET, SOCK_STREAM
+from socket import socket as create_socket
+from ssl import create_default_context, DER_cert_to_PEM_cert, SSLCertVerificationError
 from sys import argv
+
 
 # TODO Verify the whole chain is secure
 # TODO Don't save anything in the current directory but a common dir instead
@@ -28,7 +38,7 @@ class CryptoCliException(Exception):
 
 def get_bytes_from_url(url: str) -> Optional[bytes]:
     try:
-        response = requests.get(url)
+        response = get_url(url)
         if response.status_code != 200:
             response.raise_for_status()
     except (HTTPError, RequestException) as exc:
@@ -114,6 +124,49 @@ def load_cacerts(filename: str) -> dict[str, str]:
     return {name: load_pem_x509_certificate(cert.encode()) for name, cert in certs.items()}
 
 
+class CertStore:
+    def __init__(self, file_path: str, max_chain_depth: int):
+        self.cacerts, self.max_chain_depth = load_cacerts(file_path), max_chain_depth
+
+    def start_chain_traversal(self, certificate: X509Certificate):
+        self.chain_traversal_step(certificate, 0)
+
+    def chain_traversal_step(self, ssl_certificate: X509Certificate, depth: int) -> None:
+        if depth >= self.max_chain_depth:
+            raise CryptoCliException("Chain length overflow")
+        cert_aki = get_cert_extension_or_none(ssl_certificate, ExtensionOID.AUTHORITY_KEY_IDENTIFIER)
+        cert_aki_value = cert_aki._value.key_identifier if cert_aki is not None else None
+        if cert_aki_value is None:
+            if ssl_certificate.issuer != ssl_certificate.subject:
+                raise CryptoCliException("Followed chain to a non-root CA without an AKI")
+            if ssl_certificate not in self.cacerts.values():
+                raise CryptoCliException("Followed chain to a root CA not present in cacert.pem")
+            print(f"Root CA found: {ssl_certificate.subject}")
+            print(f"WARNING: No chain signature verification done")  # TODO Remove when implemented
+            return
+        aia = get_cert_extension_or_none(ssl_certificate, ExtensionOID.AUTHORITY_INFORMATION_ACCESS)
+        aia_uri_list = (
+            [item.access_location._value for item in list(aia.value) if item.access_method._name == "caIssuers"]
+            if aia is not None
+            else []
+        )
+        if aia_uri_list:
+            for item in aia_uri_list:
+                next_cert = get_certificate_from_url(item)
+                self.chain_traversal_step(next_cert, depth + 1)  # TODO Safer root search
+            return
+        print("No AIA found, searching direct link from cacert.pem")
+        for root_ca_name, cert in self.cacerts.items():
+            ski = get_cert_extension_or_none(cert, ExtensionOID.SUBJECT_KEY_IDENTIFIER)
+            if ski is None:
+                print(f"WARNING: No SKI for the root certificate {root_ca_name}")
+            if ski.value.digest.hex() == cert_aki_value.hex():
+                print(f"Root CA found: {root_ca_name}")
+                print(f"WARNING: No chain signature verification done")  # TODO Remove when implemented
+                return
+        raise CryptoCliException("Root CA not found")
+
+
 def usage():
     output_lines = [
         "crypto - crypto tools",
@@ -158,7 +211,12 @@ def main():
     if args["action"] == "get-cacert":
         return get_ca_cert_pem()
     if args["action"] == "host-check":
-        raise CryptoCliException("WiP I guess")
+        certificate = get_certificate_from_hostname_and_port(
+            *get_hostname_and_port(args["target"]), secure=not args["insecure"], timeout=TIMEOUT
+        )
+        certificate_manager = CertStore("TEMPFILES/cacert.pem", MAX_DEPTH)  # TODO : FILE PATH
+        certificate_manager.start_chain_traversal(certificate)
+        return 0
     else:
         return usage()
 
