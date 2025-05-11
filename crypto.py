@@ -14,6 +14,7 @@ from cryptography.x509.extensions import Extension as X509Extension
 from cryptography.x509.oid import ObjectIdentifier, ExtensionOID
 from enum import Enum
 from hashlib import sha256 as sha256_hasher
+from pathlib import Path
 from requests import get as get_url  # TODO REPLACE
 from typing import Any, Optional
 from socket import AF_INET, SOCK_STREAM
@@ -26,6 +27,8 @@ from urllib.request import URLError
 
 # TODO Verify the whole chain is secure
 # TODO Don't save anything in the current directory but a common dir instead
+
+SHARE_PATH = Path.home() / ".local" / "share" / "c4ffein-crypto-cli"
 
 MAX_DEPTH = 4  # TODO Parameterize
 TIMEOUT = 4  # TODO Parameterize
@@ -51,7 +54,8 @@ def get_bytes_from_url(url: str) -> Optional[bytes]:
 
 def write_to_file(obj: Any, filename: str) -> None:
     try:
-        filename = f"TEMPFILES/{filename}"  # TODO better
+        SHARE_PATH.mkdir(parents=True, exist_ok=True)
+        filename = SHARE_PATH / filename  # TODO better
         mode = "wb" if isinstance(obj, bytes) else "w"
         with open(filename, mode) as file:
             file.write(str(obj) if not isinstance(obj, bytes) else obj)
@@ -217,7 +221,7 @@ def main():
         certificate = get_certificate_from_hostname_and_port(
             *get_hostname_and_port(args["target"]), secure=not args["insecure"], timeout=TIMEOUT
         )
-        certificate_manager = CertStore("TEMPFILES/cacert.pem", MAX_DEPTH)  # TODO : FILE PATH
+        certificate_manager = CertStore(SHARE_PATH / "cacert.pem", MAX_DEPTH)  # TODO : FILE PATH
         certificate_manager.start_chain_traversal(certificate)
         return 0
     else:
