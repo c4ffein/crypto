@@ -438,6 +438,15 @@ class CertStore:
         # - If public keys match, they represent the same CA
         vprint(f"{Color.DIM.value}SKI match failed, trying public key match...")
 
+        # SECURITY: Public key matching should only apply to intermediate certificates (depth > 0)
+        # Leaf certificates (depth=0) should NEVER have a public key matching a trusted root CA
+        # This is defense-in-depth: even though TLS handshake protects us, the logic itself should reject this
+        if depth == 0:
+            raise CryptoCliException(
+                "Leaf certificate cannot be matched by public key to a trusted root. "
+                "Leaf certificates must have unique key pairs."
+            )
+
         # Extract the public key from the current certificate
         from cryptography.hazmat.primitives import serialization
         current_pubkey_bytes = ssl_certificate.public_key().public_bytes(
