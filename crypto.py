@@ -66,7 +66,7 @@ def get_bytes_from_url(url: str, timeout: int = 10, max_size: int = 1024 * 1024)
 
     # Validate URL scheme and prevent redirects to suspicious protocols
     parsed = urlparse(url)
-    if parsed.scheme not in ('http', 'https'):
+    if parsed.scheme not in ("http", "https"):
         raise CryptoCliException(f"Invalid URL scheme: {parsed.scheme}")
 
     try:
@@ -130,7 +130,7 @@ def validate_aia_url(url: str) -> None:
         raise CryptoCliException(f"AIA URL has no hostname: {url}")
 
     # Block localhost by name
-    blocked_hostnames = {'localhost', '127.0.0.1', '::1', '0.0.0.0', '::'}  # WARNING Real security should cover ranges
+    blocked_hostnames = {"localhost", "127.0.0.1", "::1", "0.0.0.0", "::"}  # WARNING Real security should cover ranges
     if parsed.hostname.lower() in blocked_hostnames:
         raise CryptoCliException(f"AIA URL points to blocked hostname: {parsed.hostname}")
 
@@ -146,7 +146,7 @@ def validate_aia_url(url: str) -> None:
         if ip.is_reserved:
             raise CryptoCliException(f"AIA URL points to reserved IP: {parsed.hostname}")
         # Check for cloud metadata endpoint specifically
-        if str(ip) == '169.254.169.254':
+        if str(ip) == "169.254.169.254":
             raise CryptoCliException(f"AIA URL points to cloud metadata endpoint: {ip}")
     except ValueError:
         # Not an IP address, it's a hostname - proceed with hostname checks
@@ -449,16 +449,15 @@ class CertStore:
 
         # Extract the public key from the current certificate
         from cryptography.hazmat.primitives import serialization
+
         current_pubkey_bytes = ssl_certificate.public_key().public_bytes(
-            encoding=serialization.Encoding.DER,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo
+            encoding=serialization.Encoding.DER, format=serialization.PublicFormat.SubjectPublicKeyInfo
         )
 
         for root_ca_name, cert in self.cacerts.items():
             if cert.subject == cert.issuer:  # Only consider self-signed roots
                 root_pubkey_bytes = cert.public_key().public_bytes(
-                    encoding=serialization.Encoding.DER,
-                    format=serialization.PublicFormat.SubjectPublicKeyInfo
+                    encoding=serialization.Encoding.DER, format=serialization.PublicFormat.SubjectPublicKeyInfo
                 )
 
                 if current_pubkey_bytes == root_pubkey_bytes:
