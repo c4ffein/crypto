@@ -282,7 +282,7 @@ def verify_hostname(cert: X509Certificate, hostname: str) -> None:
 
         for san_name in san_dns_names:
             if _match_hostname(hostname, san_name):
-                print(f"{Color.GREEN.value}✓ Hostname verified: {hostname} matches SAN {san_name}")
+                print(f"{Color.GREEN.value}✓{Color.WHITE.value} Hostname verified: {hostname} matches SAN {san_name}")
                 return
     except X509ExtensionNotFound:
         # No SAN extension, fall back to CN
@@ -294,7 +294,7 @@ def verify_hostname(cert: X509Certificate, hostname: str) -> None:
         if cn_attributes:
             cn = cn_attributes[0].value
             if _match_hostname(hostname, cn):
-                print(f"{Color.GREEN.value}✓ Hostname verified: {hostname} matches CN {cn}")
+                print(f"{Color.GREEN.value}✓{Color.WHITE.value} Hostname verified: {hostname} matches CN {cn}")
                 return
     except Exception:
         pass
@@ -370,7 +370,10 @@ class CertStore:
                 raise CryptoCliException("Followed chain to a root CA not present in cacert.pem")
             # Verify self-signature
             verify_certificate_signature(ssl_certificate, ssl_certificate)
-            print(f"{Color.GREEN.value}✓ Root CA found and verified: {ssl_certificate.subject.rfc4514_string()}")
+            print(
+                f"{Color.GREEN.value}✓{Color.WHITE.value} Root CA found and verified: "
+                f"{ssl_certificate.subject.rfc4514_string()}"
+            )
             return
 
         aia = get_cert_extension_or_none(ssl_certificate, ExtensionOID.AUTHORITY_INFORMATION_ACCESS)
@@ -385,7 +388,10 @@ class CertStore:
                 next_cert = get_certificate_from_url(item)
                 # Verify this certificate was signed by the next one in the chain
                 verify_certificate_signature(ssl_certificate, next_cert)
-                vprint(f"{Color.GREEN.value}✓ Signature verified for: {ssl_certificate.subject.rfc4514_string()}")
+                vprint(
+                    f"{Color.GREEN.value}✓{Color.WHITE.value} Signature verified for: "
+                    f"{ssl_certificate.subject.rfc4514_string()}"
+                )
                 self.chain_traversal_step(next_cert, depth + 1)
             return
 
@@ -400,8 +406,8 @@ class CertStore:
                 verify_certificate_signature(ssl_certificate, cert)
                 # Verify root CA self-signature
                 verify_certificate_signature(cert, cert)
-                print(f"{Color.GREEN.value}✓ Root CA found and verified: {root_ca_name}")
-                print(f"{Color.GREEN.value}✓ Chain signature verification complete")
+                print(f"{Color.GREEN.value}✓{Color.WHITE.value} Root CA found and verified: {root_ca_name}")
+                print(f"{Color.GREEN.value}✓{Color.WHITE.value} Chain signature verification complete")
                 return
 
         # Fallback: try matching by public key (handles cross-signed intermediates)
