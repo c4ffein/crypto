@@ -12,9 +12,9 @@ def get_crypto_path():
     return Path(__file__).parent.parent / "crypto.py"
 
 
-def run_host_check(host: str, expect_fail: bool = False) -> subprocess.CompletedProcess:
+def run_host_check(host: str, expect_fail: bool = False, max_depth: int = 6) -> subprocess.CompletedProcess:
     """Helper to run crypto host-check"""
-    cmd = ["python3", str(get_crypto_path()), "host-check", host]
+    cmd = ["python3", str(get_crypto_path()), "host-check", host, "--max-depth", str(max_depth)]
     if expect_fail:
         cmd.append("--expect-fail")
     return subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -44,6 +44,7 @@ class TestIntegrationServicesYouUse(unittest.TestCase):
         self.assertEqual(result.returncode, 0, f"STDOUT: {result.stdout}\nSTDERR: {result.stderr}")
 
     def test_qonto_s3(self):
+        # TODO FAILS: Amazon S3 serves an expired cross-signed cert in the chain (not our bug)
         result = run_host_check("qonto.s3.eu-central-1.amazonaws.com")
         self.assertEqual(result.returncode, 0, f"STDOUT: {result.stdout}\nSTDERR: {result.stderr}")
 
