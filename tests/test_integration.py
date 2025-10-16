@@ -37,6 +37,7 @@ TEST_CASES = [
     # Services you use (dogfooding)
     TestCase("anthropic_api", "api.anthropic.com"),
     TestCase("qonto_thirdparty", "thirdparty.qonto.com"),
+    # Note: AWS S3 has a very deep cert chain (>4), exceeds default max-depth
     TestCase("qonto_s3", "qonto.s3.eu-central-1.amazonaws.com"),
     # Popular services (CA diversity)
     TestCase("github", "github.com"),
@@ -44,10 +45,28 @@ TEST_CASES = [
     TestCase("letsencrypt", "letsencrypt.org"),
     TestCase("eff", "www.eff.org"),
     TestCase("badssl", "badssl.com"),
-    # Negative test cases
-    TestCase("expired_cert", "expired.badssl.com", expect_fail=True),
-    TestCase("wrong_host", "wrong.host.badssl.com", expect_fail=True),
-    TestCase("self_signed", "self-signed.badssl.com", expect_fail=True),
+    # === badssl.com Test Suite - Valid Certificates ===
+    # Modern signature algorithms
+    TestCase("badssl_sha256", "sha256.badssl.com"),
+    # Note: sha384/sha512 fail at TLS handshake level (Python's SSL rejects them)
+    # ECC certificates (should pass)
+    TestCase("badssl_ecc256", "ecc256.badssl.com"),
+    TestCase("badssl_ecc384", "ecc384.badssl.com"),
+    # RSA key sizes (should pass)
+    TestCase("badssl_rsa2048", "rsa2048.badssl.com"),
+    TestCase("badssl_rsa4096", "rsa4096.badssl.com"),
+    # Note: extended-validation and 1000-sans fail at TLS handshake (cert size/complexity issues)
+    # === badssl.com Test Suite - Invalid Certificates (expect_fail=True) ===
+    # Certificate validation failures
+    TestCase("badssl_expired", "expired.badssl.com", expect_fail=True),
+    TestCase("badssl_wrong_host", "wrong.host.badssl.com", expect_fail=True),
+    TestCase("badssl_self_signed", "self-signed.badssl.com", expect_fail=True),
+    TestCase("badssl_untrusted_root", "untrusted-root.badssl.com", expect_fail=True),
+    # Note: revoked cert detection requires OCSP/CRL checking (not implemented)
+    # revoked.badssl.com passes because we don't check revocation status
+    TestCase("badssl_no_common_name", "no-common-name.badssl.com", expect_fail=True),
+    TestCase("badssl_no_subject", "no-subject.badssl.com", expect_fail=True),
+    TestCase("badssl_incomplete_chain", "incomplete-chain.badssl.com", expect_fail=True),
 ]
 
 
