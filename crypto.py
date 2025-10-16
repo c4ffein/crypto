@@ -330,8 +330,10 @@ def parse_args():
         prog="crypto",
         description="KISS CLI crypto tools for TLS certificate verification",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        add_help=False,  # We'll handle help ourselves for KISS aesthetic
     )
 
+    parser.add_argument("-h", "--help", action="store_true", help="Show this help message")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output")
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
@@ -359,18 +361,38 @@ def parse_args():
 
     args = parser.parse_args()
 
-    if not args.command:
-        parser.print_help()
+    if args.help or not args.command:
+        print_help()
         return None
 
     return args
+
+
+def print_help():
+    D, W = Color.DIM.value, Color.WHITE.value
+    """Print KISS-style help message"""
+    help_text = f"""
+crypto - crypto tools
+─────────────────────
+{D}- {W}crypto host-check hostname[:port]                 {D}── check the TLS certificate of a remote server
+{D}- {D}crypto host-check hostname[:port] {W}--insecure      {D}── same but allows insecure connections
+{D}- {D}crypto host-check hostname[:port] {W}--timeout N     {D}── set connection timeout (default: 4s)
+{D}- {D}crypto host-check hostname[:port] {W}--max-depth N   {D}── set max chain depth (default: 4)
+{D}- {D}crypto host-check hostname[:port] {W}--expect-fail   {D}── expect verification to fail (for testing)
+{D}- {W}crypto get-cacert                                 {D}── get cacert.pem from curl.se, used to select a root CA{W}
+─────────────────────
+Global options:
+  -v, --verbose                                     {D}── enable detailed output{W}
+  -h, --help                                        {D}── show this help message{W}
+"""
+    print(help_text)
 
 
 def main():
     global VERBOSE
     args = parse_args()
     if not args:
-        return -1
+        return 0  # Help was shown, not an error
 
     VERBOSE = args.verbose
 
@@ -401,7 +423,7 @@ def main():
             else:
                 raise  # Re-raise to be caught by main exception handler
 
-    return -1
+    return 1  # Should never reach here, but return error if we do
 
 
 if __name__ == "__main__":
@@ -409,9 +431,9 @@ if __name__ == "__main__":
         exit(main())
     except KeyboardInterrupt:
         print("\n  !!  KeyboardInterrupt received  !!  \n")
-        exit(-2)
+        exit(130)  # Standard exit code for SIGINT
     except CryptoCliException as e:
         print(f"{Color.RED.value}\n  !!  {e}  !!  \n")
-        exit(-1)
+        exit(1)  # General error
     except Exception:
         raise

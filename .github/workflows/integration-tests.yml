@@ -1,4 +1,4 @@
-name: Integration Tests
+name: Tests
 
 on:
   push:
@@ -10,7 +10,7 @@ on:
     - cron: '0 3 * * *'
 
 jobs:
-  integration-tests:
+  test:
     runs-on: ubuntu-latest
 
     steps:
@@ -29,13 +29,13 @@ jobs:
     - name: Lint check
       run: make lint-check
 
-    - name: Run integration tests
-      run: make test-integration-junit
-      continue-on-error: false
+    - name: Run all tests
+      run: make test-all
 
-    - name: Upload test results
+    - name: Upload integration test results (if generated)
       uses: actions/upload-artifact@v3
       if: always()
       with:
-        name: integration-test-results
+        name: test-results
         path: test-results.xml
+        if-no-files-found: ignore

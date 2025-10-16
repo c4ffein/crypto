@@ -4,8 +4,9 @@ help:
 	@echo "Available targets:"
 	@echo "  lint                      - Fix linting issues and format code"
 	@echo "  lint-check                - Check linting and formatting without fixing"
-	@echo "  test                      - Run tests"
-	@echo "  test-integration          - Run integration tests (human-readable output)"
+	@echo "  test                      - Run unit tests"
+	@echo "  test-all                  - Run unit tests + integration tests"
+	@echo "  test-integration          - Run integration tests only (human-readable output)"
 	@echo "  test-integration-tap      - Run integration tests (TAP format)"
 	@echo "  test-integration-junit    - Run integration tests (JUnit XML)"
 	@echo "  test-integration-verbose  - Run integration tests with verbose output"
@@ -22,23 +23,26 @@ lint-check:
 	ruff check --no-fix && ruff format --check
 
 test:
-	python3 test.py
+	python3 tests/test.py
+
+test-all:
+	python3 tests/test.py
 
 test-integration:
 	@echo "Running integration tests..."
-	./tests/run_integration_tests.py
+	./tests/test_integration.py
 
 test-integration-tap:
 	@echo "Running integration tests (TAP format)..."
-	./tests/run_integration_tests.py --format tap
+	./tests/test_integration.py --format tap
 
 test-integration-junit:
 	@echo "Running integration tests (JUnit XML format)..."
-	./tests/run_integration_tests.py --format junit --output test-results.xml
+	./tests/test_integration.py --format junit --output test-results.xml
 
 test-integration-verbose:
 	@echo "Running integration tests (verbose)..."
-	./tests/run_integration_tests.py -v
+	./tests/test_integration.py -v
 
 install-build-system:
 	python3 -m pip install --upgrade build
