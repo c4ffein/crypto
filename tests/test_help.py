@@ -56,7 +56,9 @@ class TestHelpSync(unittest.TestCase):
         self.assertEqual(
             cli_help_no_color,
             readme_help,
-            f"README.md and --help output are out of sync!\nCLI help:\n{cli_help_no_color}\n\nREADME help:\n{readme_help}",
+            f"README.md and --help output are out of sync!\n"
+            f"CLI help:\n{cli_help_no_color}\n\n"
+            f"README help:\n{readme_help}",
         )
 
 

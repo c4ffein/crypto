@@ -83,7 +83,7 @@ class TestSubjectNameMatchingSecurity(unittest.TestCase):
 
         # Create a temporary cacert file with only our test root
         cls.test_cacert_path = Path(__file__).parent / "test_cacert.pem"
-        with open(cls.test_cacert_path, "w") as f:
+        with cls.test_cacert_path.open("w") as f:
             f.write("Test Root CA\n")
             f.write("=" * 70 + "\n")
             f.write(cls.root_cert.public_bytes(serialization.Encoding.PEM).decode())
@@ -238,7 +238,7 @@ class TestPublicKeyMatchingSecurity(unittest.TestCase):
 
         # Create a temporary cacert file with only our test root
         cls.test_cacert_path = Path(__file__).parent / "test_pubkey_cacert.pem"
-        with open(cls.test_cacert_path, "w") as f:
+        with cls.test_cacert_path.open("w") as f:
             f.write("Test Root CA\n")
             f.write("=" * 70 + "\n")
             f.write(cls.root_cert.public_bytes(serialization.Encoding.PEM).decode())
@@ -576,7 +576,7 @@ class TestCompleteValidChain(unittest.TestCase):
 
         # Create a temporary cacert file with only our test root
         cls.test_cacert_path = Path(__file__).parent / "test_complete_chain_cacert.pem"
-        with open(cls.test_cacert_path, "w") as f:
+        with cls.test_cacert_path.open("w") as f:
             f.write("Test Root CA\n")
             f.write("=" * 70 + "\n")
             f.write(cls.root_cert.public_bytes(serialization.Encoding.PEM).decode())
@@ -848,7 +848,7 @@ class TestChainSignatureFailure(unittest.TestCase):
 
         # Create temporary cacert file
         cls.test_cacert_path = Path(__file__).parent / "test_signature_fail_cacert.pem"
-        with open(cls.test_cacert_path, "w") as f:
+        with cls.test_cacert_path.open("w") as f:
             f.write("Legitimate Root CA\n")
             f.write("=" * 70 + "\n")
             f.write(cls.root_cert.public_bytes(serialization.Encoding.PEM).decode())
