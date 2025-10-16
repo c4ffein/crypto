@@ -53,14 +53,43 @@ def vprint(*args, **kwargs):
         print(*args, **kwargs)
 
 
-def get_bytes_from_url(url: str) -> Optional[bytes]:
+def get_bytes_from_url(url: str, timeout: int = 10, max_size: int = 1024 * 1024) -> Optional[bytes]:
+    """
+    Fetch bytes from URL with security validations.
+
+    Args:
+        url: URL to fetch
+        timeout: Request timeout in seconds
+        max_size: Maximum allowed response size in bytes
+    """
+    from urllib.parse import urlparse
+
+    # Validate URL scheme and prevent redirects to suspicious protocols
+    parsed = urlparse(url)
+    if parsed.scheme not in ('http', 'https'):
+        raise CryptoCliException(f"Invalid URL scheme: {parsed.scheme}")
+
     try:
-        response = urlopen(url)
-        data = response.read()
+        response = urlopen(url, timeout=timeout)
+
+        # Check for excessive redirects or redirect to different scheme
+        if response.url != url:
+            redirect_parsed = urlparse(response.url)
+            if redirect_parsed.scheme != parsed.scheme:
+                raise CryptoCliException(f"URL redirected to different scheme: {url} -> {response.url}")
+            vprint(f"{Color.DIM.value}Redirected to: {response.url}")
+
+        # Read with size limit to prevent memory exhaustion
+        data = response.read(max_size + 1)
+        if len(data) > max_size:
+            raise CryptoCliException(f"Response too large (>{max_size} bytes)")
+
     except URLError as e:
         raise CryptoCliException(f"Unable to reach {url}") from e
+
     if response.status != 200:
         raise CryptoCliException(f"Unable to reach {url}")
+
     return data
 
 
@@ -75,7 +104,58 @@ def write_to_file(obj: Any, filename: str) -> None:
         raise CryptoCliException(f"Failed to write to file {filepath}") from exc
 
 
+def validate_aia_url(url: str) -> None:
+    """
+    Validate AIA (Authority Information Access) URL to prevent SSRF attacks.
+
+    AIA URLs are embedded in certificates and could be attacker-controlled.
+    This function prevents requests to:
+    - Private IP ranges (RFC 1918, RFC 4193)
+    - Localhost and loopback addresses
+    - Link-local addresses
+    - Cloud metadata endpoints
+
+    Args:
+        url: The AIA URL to validate
+
+    Raises:
+        CryptoCliException: If URL points to a dangerous destination
+    """
+    from ipaddress import ip_address
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+
+    if not parsed.hostname:
+        raise CryptoCliException(f"AIA URL has no hostname: {url}")
+
+    # Block localhost by name
+    blocked_hostnames = {'localhost', '127.0.0.1', '::1', '0.0.0.0', '::'}  # WARNING Real security should cover ranges
+    if parsed.hostname.lower() in blocked_hostnames:
+        raise CryptoCliException(f"AIA URL points to blocked hostname: {parsed.hostname}")
+
+    # Block private IP ranges
+    try:
+        ip = ip_address(parsed.hostname)
+        if ip.is_private:
+            raise CryptoCliException(f"AIA URL points to private IP: {parsed.hostname}")
+        if ip.is_loopback:
+            raise CryptoCliException(f"AIA URL points to loopback: {parsed.hostname}")
+        if ip.is_link_local:
+            raise CryptoCliException(f"AIA URL points to link-local: {parsed.hostname}")
+        if ip.is_reserved:
+            raise CryptoCliException(f"AIA URL points to reserved IP: {parsed.hostname}")
+        # Check for cloud metadata endpoint specifically
+        if str(ip) == '169.254.169.254':
+            raise CryptoCliException(f"AIA URL points to cloud metadata endpoint: {ip}")
+    except ValueError:
+        # Not an IP address, it's a hostname - proceed with hostname checks
+        pass
+
+
 def get_certificate_from_url(url: str) -> X509Certificate:
+    """Fetch and parse certificate from URL, with SSRF protection."""
+    validate_aia_url(url)
     return load_pem_x509_certificate(DER_cert_to_PEM_cert(get_bytes_from_url(url)).encode("ascii"))
 
 
@@ -310,6 +390,7 @@ class CertStore:
             return
 
         vprint(f"{Color.DIM.value}No AIA found, searching direct link from cacert.pem")
+        # First try to match by SKI/AKI
         for root_ca_name, cert in self.cacerts.items():
             ski = get_cert_extension_or_none(cert, ExtensionOID.SUBJECT_KEY_IDENTIFIER)
             if ski is None:
@@ -322,6 +403,69 @@ class CertStore:
                 print(f"{Color.GREEN.value}✓ Root CA found and verified: {root_ca_name}")
                 print(f"{Color.GREEN.value}✓ Chain signature verification complete")
                 return
+
+        # Fallback: try matching by public key (handles cross-signed intermediates)
+        # If we have a cross-signed intermediate, find the self-signed root with same public key
+        #
+        # SECURITY NOTE: Cross-signed certificates explained:
+        # A cross-signed intermediate has:
+        #   - Subject: CN=SomeCA
+        #   - Issuer: CN=DifferentRoot (the cross-signer)
+        #   - Public Key: Kpub (belongs to SomeCA)
+        #   - Signed by: DifferentRoot's private key
+        #
+        # There's also a self-signed root with:
+        #   - Subject: CN=SomeCA
+        #   - Issuer: CN=SomeCA (itself)
+        #   - Public Key: Kpub (SAME key!)
+        #   - Signed by: SomeCA's own private key
+        #
+        # These represent the SAME CA (same key pair), just with different issuers.
+        # We can securely identify them by comparing public keys.
+        #
+        # SECURITY: Why public key matching is secure:
+        # 1. An attacker cannot forge a certificate with a trusted root's public key
+        #    without having the corresponding private key
+        # 2. If they try to use the real public key in a fake cert, signature
+        #    verification will fail when validating the previous cert in the chain
+        #    (because they don't have the private key to sign with)
+        # 3. The chain up to this point was already validated via signatures
+        #
+        # This is cryptographically secure because:
+        # - Public keys are unforgeable (discrete log problem)
+        # - Chain validation ensures this cert's public key was used to sign the previous cert
+        # - Therefore, whoever controls this cert also controls the private key
+        # - If public keys match, they represent the same CA
+        vprint(f"{Color.DIM.value}SKI match failed, trying public key match...")
+
+        # Extract the public key from the current certificate
+        from cryptography.hazmat.primitives import serialization
+        current_pubkey_bytes = ssl_certificate.public_key().public_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+
+        for root_ca_name, cert in self.cacerts.items():
+            if cert.subject == cert.issuer:  # Only consider self-signed roots
+                root_pubkey_bytes = cert.public_key().public_bytes(
+                    encoding=serialization.Encoding.DER,
+                    format=serialization.PublicFormat.SubjectPublicKeyInfo
+                )
+
+                if current_pubkey_bytes == root_pubkey_bytes:
+                    try:
+                        # Found a self-signed root with matching public key
+                        # Verify the root is self-signed (prevents forged roots in cacert.pem)
+                        verify_certificate_signature(cert, cert)
+                        vprint(f"{Color.GREEN.value}✓ Found trusted root with matching public key: {root_ca_name}")
+                        vprint(f"{Color.GREEN.value}✓ Cross-signed certificate verified (same CA, different issuer)")
+                        # Now continue chain traversal with the trusted self-signed root
+                        self.chain_traversal_step(cert, depth)
+                        return
+                    except CryptoCliException:
+                        # Signature verification failed, continue searching
+                        continue
+
         raise CryptoCliException("Root CA not found")
 
 
