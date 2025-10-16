@@ -353,7 +353,7 @@ class CertStore:
             verify_hostname(certificate, self.hostname)
         self.chain_traversal_step(certificate, 0)
 
-    def chain_traversal_step(self, ssl_certificate: X509Certificate, depth: int) -> None:
+    def chain_traversal_step(self, ssl_certificate: X509Certificate, depth: int) -> None:  # noqa: C901
         if depth >= self.max_chain_depth:
             raise CryptoCliException("Chain length overflow")
 
