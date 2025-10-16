@@ -46,27 +46,47 @@ TEST_CASES = [
     TestCase("eff", "www.eff.org"),
     TestCase("badssl", "badssl.com"),
     # === badssl.com Test Suite - Valid Certificates ===
-    # Modern signature algorithms
+    # Signature algorithms
     TestCase("badssl_sha256", "sha256.badssl.com"),
-    # Note: sha384/sha512 fail at TLS handshake level (Python's SSL rejects them)
-    # ECC certificates (should pass)
+    # Note: sha384/sha512 fail at TLS handshake level (Python's SSL rejects them before we can verify)
+    # ECC key types
     TestCase("badssl_ecc256", "ecc256.badssl.com"),
     TestCase("badssl_ecc384", "ecc384.badssl.com"),
-    # RSA key sizes (should pass)
+    # RSA key sizes
     TestCase("badssl_rsa2048", "rsa2048.badssl.com"),
     TestCase("badssl_rsa4096", "rsa4096.badssl.com"),
-    # Note: extended-validation and 1000-sans fail at TLS handshake (cert size/complexity issues)
+    # Note: rsa8192 fails at TLS handshake (rejected 8192-bit keys, won't investigate for now)
+    # Extended validation
+    # Note: extended-validation fails at TLS handshake (cert complexity issue)
+    # Subject Alternative Names (SANs)
+    # Note: 1000-sans and 10000-sans fail at TLS handshake (cert size too large)
+    # Long domain names
+    TestCase("badssl_long_subdomain", "long-extended-subdomain-name-containing-many-letters-and-dashes.badssl.com"),
+    TestCase("badssl_long_no_dashes", "longextendedsubdomainnamewithoutdashesinordertotestwordwrapping.badssl.com"),
+    # Mozilla cipher suites (these test TLS config, but certs should be valid)
+    TestCase("badssl_mozilla_modern", "mozilla-modern.badssl.com"),
+    TestCase("badssl_mozilla_intermediate", "mozilla-intermediate.badssl.com"),
     # === badssl.com Test Suite - Invalid Certificates (expect_fail=True) ===
     # Certificate validation failures
     TestCase("badssl_expired", "expired.badssl.com", expect_fail=True),
     TestCase("badssl_wrong_host", "wrong.host.badssl.com", expect_fail=True),
     TestCase("badssl_self_signed", "self-signed.badssl.com", expect_fail=True),
     TestCase("badssl_untrusted_root", "untrusted-root.badssl.com", expect_fail=True),
-    # Note: revoked cert detection requires OCSP/CRL checking (not implemented)
-    # revoked.badssl.com passes because we don't check revocation status
+    TestCase("badssl_incomplete_chain", "incomplete-chain.badssl.com", expect_fail=True),
     TestCase("badssl_no_common_name", "no-common-name.badssl.com", expect_fail=True),
     TestCase("badssl_no_subject", "no-subject.badssl.com", expect_fail=True),
-    TestCase("badssl_incomplete_chain", "incomplete-chain.badssl.com", expect_fail=True),
+    # Known compromised/malicious root CAs
+    TestCase("badssl_superfish", "superfish.badssl.com", expect_fail=True),
+    TestCase("badssl_edellroot", "edellroot.badssl.com", expect_fail=True),
+    TestCase("badssl_dsdtestprovider", "dsdtestprovider.badssl.com", expect_fail=True),
+    TestCase("badssl_webpack", "webpack-dev-server.badssl.com", expect_fail=True),
+    # SHA-1 certificates (deprecated)
+    TestCase("badssl_sha1_2016", "sha1-2016.badssl.com", expect_fail=True),
+    TestCase("badssl_sha1_2017", "sha1-2017.badssl.com", expect_fail=True),
+    TestCase("badssl_sha1_intermediate", "sha1-intermediate.badssl.com", expect_fail=True),
+    # Note: revoked.badssl.com not included - requires OCSP/CRL checking (not implemented)
+    # Note: pinning-test.badssl.com not relevant - we don't implement certificate pinning
+    # Note: client.badssl.com/client-cert-missing.badssl.com - require client certs (different use case)
 ]
 
 
