@@ -1,7 +1,8 @@
-.PHONY: help lint lint-check test test-unit test-integration install-build-system build-package install-package-uploader upload-package-test upload-package
+.PHONY: help verify lint lint-check test test-unit test-integration install-build-system build-package install-package-uploader upload-package-test upload-package
 
 help:
 	@echo "Available targets:"
+	@echo "  verify                    - Run lint-check and all tests (CI-ready)"
 	@echo "  lint                      - Fix linting issues and format code"
 	@echo "  lint-check                - Check linting and formatting without fixing"
 	@echo "  test                      - Run all tests (unit + integration)"
@@ -12,6 +13,9 @@ help:
 	@echo "  install-package-uploader  - Install twine for uploading"
 	@echo "  upload-package-test       - Upload to TestPyPI"
 	@echo "  upload-package            - Upload to PyPI"
+
+verify:
+	make lint-check && make test
 
 lint:
 	ruff check --fix; ruff format

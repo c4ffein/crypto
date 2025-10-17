@@ -31,8 +31,6 @@ from cryptography.x509 import load_pem_x509_certificate
 from cryptography.x509.extensions import Extension as X509Extension
 from cryptography.x509.oid import ExtensionOID, NameOID, ObjectIdentifier
 
-# TODO Don't save anything in the current directory but a common dir instead
-
 SHARE_PATH = Path.home() / ".local" / "share" / "c4ffein-crypto-cli"
 
 MAX_DEPTH = 4
@@ -159,7 +157,8 @@ def get_certificate_from_url(url: str) -> X509Certificate:
     return load_pem_x509_certificate(DER_cert_to_PEM_cert(get_bytes_from_url(url)).encode("ascii"))
 
 
-def get_ca_cert_pem() -> None:  # TODO Specify a better location
+def get_ca_cert_pem() -> None:
+    """Download Mozilla's CA certificate bundle to ~/.local/share/c4ffein-crypto-cli/cacert.pem"""
     write_to_file(get_bytes_from_url("https://curl.se/ca/cacert.pem"), "cacert.pem")
 
 
