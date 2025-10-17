@@ -173,9 +173,7 @@ def get_hostname_and_port(host):
         raise CryptoCliException(f"Unable to parse host: {host}") from exc
 
 
-def get_certificate_from_hostname_and_port(
-    hostname, port, secure: bool = True, timeout: Optional[int] = None
-) -> X509Certificate:
+def get_certificate_from_hostname_and_port(hostname, port, timeout: Optional[int] = None) -> X509Certificate:
     try:
         vprint(f"{Color.DIM.value}Connecting to {hostname}:{port}...")
         sock = create_socket(AF_INET, SOCK_STREAM)
@@ -499,9 +497,6 @@ def parse_args():
     host_check_parser = subparsers.add_parser("host-check", help="Check the TLS certificate of a remote server")
     host_check_parser.add_argument("target", help="Hostname or hostname:port (default port: 443)")
     host_check_parser.add_argument(
-        "--insecure", action="store_true", help="Allow insecure connections (skip initial SSL verification)"
-    )
-    host_check_parser.add_argument(
         "--timeout", type=int, default=TIMEOUT, help=f"Connection timeout in seconds (default: {TIMEOUT})"
     )
     host_check_parser.add_argument(
@@ -532,7 +527,6 @@ def print_help():
 crypto - crypto tools
 ─────────────────────
 {D}- {W}crypto host-check hostname[:port]                 {D}── check the TLS certificate of a remote server
-{D}- {D}crypto host-check hostname[:port] {W}--insecure      {D}── same but allows insecure connections
 {D}- {D}crypto host-check hostname[:port] {W}--timeout N     {D}── set connection timeout (default: 4s)
 {D}- {D}crypto host-check hostname[:port] {W}--max-depth N   {D}── set max chain depth (default: 4)
 {D}- {D}crypto host-check hostname[:port] {W}--expect-fail   {D}── expect verification to fail (for testing)
@@ -561,9 +555,7 @@ def main():
     if args.command == "host-check":
         try:
             hostname, port = get_hostname_and_port(args.target)
-            certificate = get_certificate_from_hostname_and_port(
-                hostname, port, secure=not args.insecure, timeout=args.timeout
-            )
+            certificate = get_certificate_from_hostname_and_port(hostname, port, timeout=args.timeout)
             certificate_manager = CertStore(SHARE_PATH / "cacert.pem", args.max_depth, hostname=hostname)
             certificate_manager.start_chain_traversal(certificate)
             print(f"{Color.GREEN.value}✓ Certificate chain verification complete!")

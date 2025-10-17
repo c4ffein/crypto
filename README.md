@@ -13,7 +13,6 @@ pip install cryptography
 crypto - crypto tools
 ─────────────────────
 - crypto host-check hostname[:port]                 ── check the TLS certificate of a remote server
-- crypto host-check hostname[:port] --insecure      ── same but allows insecure connections
 - crypto host-check hostname[:port] --timeout N     ── set connection timeout (default: 4s)
 - crypto host-check hostname[:port] --max-depth N   ── set max chain depth (default: 4)
 - crypto host-check hostname[:port] --expect-fail   ── expect verification to fail (for testing)
