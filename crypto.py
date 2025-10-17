@@ -4,6 +4,8 @@
 crypto - KISS CLI crypto tools
 MIT License - Copyright (c) 2025 c4ffein
 
+I wouldn't recommend to use this if you are not aware of the security implications
+
 Features:
 - Full certificate chain verification with cryptographic signature validation
 - Hostname verification (SAN/CN with wildcard support per RFC 6125)

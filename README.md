@@ -1,6 +1,8 @@
 # crypto
 KISS CLI crypto tools for TLS certificate verification, in Python
 
+**I wouldn't recommend to use this if you are not aware of the security implications**
+
 ## Install
 
 ```bash
