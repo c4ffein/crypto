@@ -356,12 +356,11 @@ class CertStore:
     def chain_traversal_step(self, ssl_certificate: X509Certificate, depth: int) -> None:  # noqa: C901
         if depth >= self.max_chain_depth:
             raise CryptoCliException("Chain length overflow")
-
         # Check certificate validity period
         check_certificate_validity(ssl_certificate)
-
         cert_aki = get_cert_extension_or_none(ssl_certificate, ExtensionOID.AUTHORITY_KEY_IDENTIFIER)
         cert_aki_value = cert_aki._value.key_identifier if cert_aki is not None else None
+        # Check root cert as no aki
         if cert_aki_value is None:
             # Self-signed root certificate
             if ssl_certificate.issuer != ssl_certificate.subject:
@@ -375,28 +374,9 @@ class CertStore:
                 f"{ssl_certificate.subject.rfc4514_string()}"
             )
             return
-
-        aia = get_cert_extension_or_none(ssl_certificate, ExtensionOID.AUTHORITY_INFORMATION_ACCESS)
-        aia_uri_list = (
-            [item.access_location._value for item in list(aia.value) if item.access_method._name == "caIssuers"]
-            if aia is not None
-            else []
-        )
-        if aia_uri_list:
-            for item in aia_uri_list:
-                vprint(f"{Color.DIM.value}Fetching issuer from: {item}")
-                next_cert = get_certificate_from_url(item)
-                # Verify this certificate was signed by the next one in the chain
-                verify_certificate_signature(ssl_certificate, next_cert)
-                vprint(
-                    f"{Color.GREEN.value}✓{Color.WHITE.value} Signature verified for: "
-                    f"{ssl_certificate.subject.rfc4514_string()}"
-                )
-                self.chain_traversal_step(next_cert, depth + 1)
-            return
-
-        vprint(f"{Color.DIM.value}No AIA found, searching direct link from cacert.pem")
-        # First try to match by SKI/AKI
+        # Check root cert in cacert.pem anyway
+        vprint(f"{Color.DIM.value}First searching direct link from cacert.pem")
+        # First try to match by SKI/AKI in roots
         for root_ca_name, cert in self.cacerts.items():
             ski = get_cert_extension_or_none(cert, ExtensionOID.SUBJECT_KEY_IDENTIFIER)
             if ski is None:
@@ -409,7 +389,6 @@ class CertStore:
                 print(f"{Color.GREEN.value}✓{Color.WHITE.value} Root CA found and verified: {root_ca_name}")
                 print(f"{Color.GREEN.value}✓{Color.WHITE.value} Chain signature verification complete")
                 return
-
         # Fallback: try matching by public key (handles cross-signed intermediates)
         # If we have a cross-signed intermediate, find the self-signed root with same public key
         #
@@ -442,45 +421,65 @@ class CertStore:
         # - Chain validation ensures this cert's public key was used to sign the previous cert
         # - Therefore, whoever controls this cert also controls the private key
         # - If public keys match, they represent the same CA
-        vprint(f"{Color.DIM.value}SKI match failed, trying public key match...")
-
-        # SECURITY: Public key matching should only apply to intermediate certificates (depth > 0)
-        # Leaf certificates (depth=0) should NEVER have a public key matching a trusted root CA
-        # This is defense-in-depth: even though TLS handshake protects us, the logic itself should reject this
-        if depth == 0:
-            raise CryptoCliException(
-                "Leaf certificate cannot be matched by public key to a trusted root. "
-                "Leaf certificates must have unique key pairs."
-            )
-
+        vprint(f"{Color.DIM.value}Trying public key match without SKI match for intermediate cert...")
         # Extract the public key from the current certificate
         from cryptography.hazmat.primitives import serialization
 
         current_pubkey_bytes = ssl_certificate.public_key().public_bytes(
             encoding=serialization.Encoding.DER, format=serialization.PublicFormat.SubjectPublicKeyInfo
         )
-
+        # SECURITY: Public key matching should only apply to intermediate certificates (depth > 0)
+        # Leaf certificates (depth=0) should NEVER have a public key matching a trusted root CA
+        # This is defense-in-depth: even though TLS handshake protects us, the logic itself should reject this
         for root_ca_name, cert in self.cacerts.items():
             if cert.subject == cert.issuer:  # Only consider self-signed roots
                 root_pubkey_bytes = cert.public_key().public_bytes(
                     encoding=serialization.Encoding.DER, format=serialization.PublicFormat.SubjectPublicKeyInfo
                 )
-
                 if current_pubkey_bytes == root_pubkey_bytes:
-                    try:
-                        # Found a self-signed root with matching public key
-                        # Verify the root is self-signed (prevents forged roots in cacert.pem)
-                        verify_certificate_signature(cert, cert)
-                        vprint(f"{Color.GREEN.value}✓ Found trusted root with matching public key: {root_ca_name}")
-                        vprint(f"{Color.GREEN.value}✓ Cross-signed certificate verified (same CA, different issuer)")
-                        # Now continue chain traversal with the trusted self-signed root
-                        self.chain_traversal_step(cert, depth)
-                        return
-                    except CryptoCliException:
-                        # Signature verification failed, continue searching
-                        continue
-
-        raise CryptoCliException("Root CA not found")
+                    # Found matching public key - behavior depends on depth
+                    if depth == 0:
+                        # Leaf certificate with root's public key - reject (defense-in-depth)
+                        raise CryptoCliException(
+                            "Leaf certificate cannot be matched by public key to a trusted root. "
+                            "Leaf certificates must have unique key pairs."
+                        )
+                    else:
+                        # Intermediate with root's public key - accept as cross-signed cert
+                        try:
+                            # Verify the root is self-signed (prevents forged roots in cacert.pem)
+                            verify_certificate_signature(cert, cert)
+                            vprint(f"{Color.GREEN.value}✓ Found trusted root with matching public key: {root_ca_name}")
+                            vprint(
+                                f"{Color.GREEN.value}✓ Cross-signed certificate verified (same CA, different issuer)"
+                            )
+                            # Now continue chain traversal with the trusted self-signed root
+                            self.chain_traversal_step(cert, depth)
+                            return
+                        except CryptoCliException:
+                            # Signature verification failed, continue searching
+                            continue
+        vprint(f"{Color.DIM.value}Then tries to follow the chain")
+        # Tries to follow the AIA
+        aia = get_cert_extension_or_none(ssl_certificate, ExtensionOID.AUTHORITY_INFORMATION_ACCESS)
+        aia_uri_list = (
+            [item.access_location._value for item in list(aia.value) if item.access_method._name == "caIssuers"]
+            if aia is not None
+            else []
+        )
+        if aia_uri_list:
+            for item in aia_uri_list:
+                vprint(f"{Color.DIM.value}Fetching issuer from: {item}")
+                next_cert = get_certificate_from_url(item)
+                # Verify this certificate was signed by the next one in the chain
+                verify_certificate_signature(ssl_certificate, next_cert)
+                vprint(
+                    f"{Color.GREEN.value}✓{Color.WHITE.value} Signature verified for: "
+                    f"{ssl_certificate.subject.rfc4514_string()}"
+                )
+                self.chain_traversal_step(next_cert, depth + 1)
+            return
+        raise CryptoCliException("Broken chain")
 
 
 def parse_args():

@@ -3,8 +3,8 @@
 Test runner for crypto CLI tool
 
 Usage:
-    python test.py              # Run ALL tests (unit + integration + e2e)
-    python test.py --all        # Run ALL tests (unit + integration + e2e)
+    python test.py              # Run ALL tests (unit + integration)
+    python test.py --all        # Run ALL tests (unit + integration)
     python test.py --unit       # Run unit tests only
     python test.py --integration # Run integration tests only
 """
@@ -24,14 +24,21 @@ if __name__ == "__main__":
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
 
-    if run_all or run_unit_only:
+    if run_all:
+        # Discover ALL test_*.py files (includes integration tests)
+        print("=" * 70)
+        print("Running all tests...")
+        print("=" * 70)
+        suite.addTests(loader.discover("tests", pattern="test_*.py"))
+    elif run_unit_only:
+        # Discover unit tests only (exclude test_integration.py)
         print("=" * 70)
         print("Running unit tests...")
         print("=" * 70)
-        # Discover all test_*.py files except integration
-        suite.addTests(loader.discover("tests", pattern="test_*.py"))
-
-    if run_all or run_integration_only:
+        for pattern in ["test_security.py", "test_help.py", "test_exit_codes.py"]:
+            suite.addTests(loader.discover("tests", pattern=pattern))
+    elif run_integration_only:
+        # Discover integration tests only
         print("=" * 70)
         print("Running integration tests...")
         print("=" * 70)
