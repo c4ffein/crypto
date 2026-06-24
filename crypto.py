@@ -15,14 +15,13 @@ Features:
 """
 
 import argparse
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from hashlib import sha256 as sha256_hasher
 from pathlib import Path
-from socket import AF_INET, SOCK_STREAM
-from socket import socket as create_socket
+from socket import create_connection
 from ssl import DER_cert_to_PEM_cert, SSLCertVerificationError, create_default_context
-from typing import Any, Optional
+from typing import Any
 from urllib.request import URLError, urlopen
 
 from cryptography.exceptions import InvalidSignature
@@ -31,7 +30,7 @@ from cryptography.x509 import Certificate as X509Certificate
 from cryptography.x509 import ExtensionNotFound as X509ExtensionNotFound
 from cryptography.x509 import load_pem_x509_certificate
 from cryptography.x509.extensions import Extension as X509Extension
-from cryptography.x509.oid import ExtensionOID, NameOID, ObjectIdentifier
+from cryptography.x509.oid import AuthorityInformationAccessOID, ExtensionOID, NameOID, ObjectIdentifier
 
 SHARE_PATH = Path.home() / ".local" / "share" / "c4ffein-crypto-cli"
 
@@ -53,7 +52,7 @@ def vprint(*args, **kwargs):
         print(*args, **kwargs)
 
 
-def get_bytes_from_url(url: str, timeout: int = 10, max_size: int = 1024 * 1024) -> Optional[bytes]:
+def get_bytes_from_url(url: str, timeout: int = 10, max_size: int = 1024 * 1024) -> bytes:
     """
     Fetch bytes from URL with security validations.
 
@@ -108,12 +107,16 @@ def validate_aia_url(url: str) -> None:
     """
     Validate AIA (Authority Information Access) URL to prevent SSRF attacks.
 
-    AIA URLs are embedded in certificates and could be attacker-controlled.
-    This function prevents requests to:
-    - Private IP ranges (RFC 1918, RFC 4193)
-    - Localhost and loopback addresses
-    - Link-local addresses
-    - Cloud metadata endpoints
+    AIA URLs come from the certificate chain and are therefore attacker-influenced.
+    We resolve the hostname and require *every* resolved address to be globally
+    routable. ipaddress.is_global rejects private (RFC 1918 / RFC 4193), loopback,
+    link-local (including the 169.254.169.254 cloud-metadata endpoint) and reserved
+    ranges in a single allowlist-style check.
+
+    Residual risk: urlopen re-resolves the hostname when it connects, so a fast-
+    flipping DNS record could rebind to a private address between this check and the
+    fetch (TOCTOU / DNS rebinding). Fully closing that requires connecting to the
+    validated IP directly and passing the hostname only for Host/SNI.
 
     Args:
         url: The AIA URL to validate
@@ -122,35 +125,26 @@ def validate_aia_url(url: str) -> None:
         CryptoCliException: If URL points to a dangerous destination
     """
     from ipaddress import ip_address
+    from socket import getaddrinfo
     from urllib.parse import urlparse
 
     parsed = urlparse(url)
-
+    if parsed.scheme not in ("http", "https"):
+        raise CryptoCliException(f"AIA URL has invalid scheme: {parsed.scheme}")
     if not parsed.hostname:
         raise CryptoCliException(f"AIA URL has no hostname: {url}")
 
-    # Block localhost by name
-    blocked_hostnames = {"localhost", "127.0.0.1", "::1", "0.0.0.0", "::"}  # WARNING Real security should cover ranges
-    if parsed.hostname.lower() in blocked_hostnames:
-        raise CryptoCliException(f"AIA URL points to blocked hostname: {parsed.hostname}")
-
-    # Block private IP ranges
     try:
-        ip = ip_address(parsed.hostname)
-        if ip.is_private:
-            raise CryptoCliException(f"AIA URL points to private IP: {parsed.hostname}")
-        if ip.is_loopback:
-            raise CryptoCliException(f"AIA URL points to loopback: {parsed.hostname}")
-        if ip.is_link_local:
-            raise CryptoCliException(f"AIA URL points to link-local: {parsed.hostname}")
-        if ip.is_reserved:
-            raise CryptoCliException(f"AIA URL points to reserved IP: {parsed.hostname}")
-        # Check for cloud metadata endpoint specifically
-        if str(ip) == "169.254.169.254":
-            raise CryptoCliException(f"AIA URL points to cloud metadata endpoint: {ip}")
-    except ValueError:
-        # Not an IP address, it's a hostname - proceed with hostname checks
-        pass
+        infos = getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
+    except OSError as exc:
+        raise CryptoCliException(f"AIA URL host does not resolve: {parsed.hostname}") from exc
+
+    for addr in {info[4][0] for info in infos}:
+        ip = ip_address(addr.split("%")[0])  # strip any IPv6 zone id
+        if ip.version == 6 and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped  # ::ffff:10.0.0.1 must be judged as 10.0.0.1, not as a v6 address
+        if not ip.is_global:
+            raise CryptoCliException(f"AIA URL resolves to non-global address {addr}: {parsed.hostname}")
 
 
 def get_certificate_from_url(url: str) -> X509Certificate:
@@ -174,15 +168,13 @@ def get_hostname_and_port(host):
         raise CryptoCliException(f"Unable to parse host: {host}") from exc
 
 
-def get_certificate_from_hostname_and_port(hostname, port, timeout: Optional[int] = None) -> X509Certificate:
+def get_certificate_from_hostname_and_port(hostname, port, timeout: int | None = None) -> X509Certificate:
     try:
         vprint(f"{Color.DIM.value}Connecting to {hostname}:{port}...")
-        sock = create_socket(AF_INET, SOCK_STREAM)
-        if timeout:
-            sock.settimeout(timeout)
-        wrapped_socket = create_default_context().wrap_socket(sock, server_hostname=hostname)
-        wrapped_socket.connect((hostname, port))
-        der_cert_bin = wrapped_socket.getpeercert(True)
+        # create_connection resolves through getaddrinfo, so both IPv4 and IPv6 hosts work
+        with create_connection((hostname, port), timeout=timeout) as sock:
+            with create_default_context().wrap_socket(sock, server_hostname=hostname) as wrapped_socket:
+                der_cert_bin = wrapped_socket.getpeercert(True)
         sha256 = sha256_hasher(der_cert_bin).hexdigest()
         vprint(f"Certificate SHA256: {sha256}")
         ssl_certificate = DER_cert_to_PEM_cert(der_cert_bin)
@@ -195,7 +187,7 @@ def get_certificate_from_hostname_and_port(hostname, port, timeout: Optional[int
 
 def get_cert_extension_or_none(
     ssl_certificate: X509Certificate, object_identifier: ObjectIdentifier
-) -> Optional[X509Extension]:
+) -> X509Extension | None:
     """
     The get_extension_for_oid doesn't handle the edge case where a certificate would have multiple AIA extensions
     Section 4.2 of RFC 5280 => "A certificate MUST NOT include more than one instance of a particular extension."
@@ -238,7 +230,7 @@ def verify_certificate_signature(cert: X509Certificate, issuer_cert: X509Certifi
                 cert.tbs_certificate_bytes,
                 signature_hash_algorithm,
             )
-        elif isinstance(issuer_public_key, (ed25519.Ed25519PublicKey, ed448.Ed448PublicKey)):
+        elif isinstance(issuer_public_key, ed25519.Ed25519PublicKey | ed448.Ed448PublicKey):
             # EdDSA doesn't use a separate hash algorithm
             issuer_public_key.verify(
                 cert.signature,
@@ -258,7 +250,7 @@ def check_certificate_validity(cert: X509Certificate) -> None:
     Check if certificate is currently valid (not expired or not yet valid).
     Raises CryptoCliException if certificate is not valid.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     if now < cert.not_valid_before_utc:
         raise CryptoCliException(f"Certificate not yet valid (valid from {cert.not_valid_before_utc})")
     if now > cert.not_valid_after_utc:
@@ -332,17 +324,19 @@ def load_cacerts(filename: str) -> dict[str, str]:
         raise CryptoCliException("cacert.pem not found: get it with 'crypto get-cacert'") from exc
     begins = [i for i, line in enumerate(lines) if line.startswith("-----BEGIN CERTIFICATE-----")]
     ends = [i for i, line in enumerate(lines) if line.startswith("-----END CERTIFICATE-----")]
-    if len(begins) != len(ends) or begins[0] < 2 or any(a >= b for a, b in zip(begins, ends)):
+    if len(begins) != len(ends) or begins[0] < 2 or any(a >= b for a, b in zip(begins, ends, strict=True)):
         raise CryptoCliException("cacert.pem could not be parsed")
     if any(not lines[i - 1].startswith("=====") for i in begins):
         raise CryptoCliException("cacert.pem could not be parsed")
-    certs = {lines[b - 2]: "\n".join(lines[i] for i in range(b, e + 1)) + "\n" for b, e in zip(begins, ends)}
+    certs = {
+        lines[b - 2]: "\n".join(lines[i] for i in range(b, e + 1)) + "\n" for b, e in zip(begins, ends, strict=True)
+    }
     vprint(f"{len(certs)} root CAs loaded from cacert.pem")
     return {name: load_pem_x509_certificate(cert.encode()) for name, cert in certs.items()}
 
 
 class CertStore:
-    def __init__(self, file_path: str, max_chain_depth: int, hostname: Optional[str] = None):
+    def __init__(self, file_path: str, max_chain_depth: int, hostname: str | None = None):
         self.cacerts, self.max_chain_depth = load_cacerts(file_path), max_chain_depth
         self.hostname = hostname
 
@@ -358,7 +352,7 @@ class CertStore:
         # Check certificate validity period
         check_certificate_validity(ssl_certificate)
         cert_aki = get_cert_extension_or_none(ssl_certificate, ExtensionOID.AUTHORITY_KEY_IDENTIFIER)
-        cert_aki_value = cert_aki._value.key_identifier if cert_aki is not None else None
+        cert_aki_value = cert_aki.value.key_identifier if cert_aki is not None else None
         # Check root cert as no aki
         if cert_aki_value is None:
             # Self-signed root certificate
@@ -462,7 +456,11 @@ class CertStore:
         # Tries to follow the AIA
         aia = get_cert_extension_or_none(ssl_certificate, ExtensionOID.AUTHORITY_INFORMATION_ACCESS)
         aia_uri_list = (
-            [item.access_location._value for item in list(aia.value) if item.access_method._name == "caIssuers"]
+            [
+                item.access_location.value
+                for item in aia.value
+                if item.access_method == AuthorityInformationAccessOID.CA_ISSUERS
+            ]
             if aia is not None
             else []
         )
