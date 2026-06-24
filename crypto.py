@@ -15,6 +15,7 @@ Features:
 """
 
 import argparse
+import sys
 from datetime import UTC, datetime
 from enum import Enum
 from hashlib import sha256 as sha256_hasher
@@ -25,6 +26,7 @@ from typing import Any
 from urllib.request import URLError, urlopen
 
 from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed448, ed25519, padding, rsa
 from cryptography.x509 import Certificate as X509Certificate
 from cryptography.x509 import ExtensionNotFound as X509ExtensionNotFound
@@ -37,6 +39,7 @@ SHARE_PATH = Path.home() / ".local" / "share" / "c4ffein-crypto-cli"
 MAX_DEPTH = 4
 TIMEOUT = 4
 VERBOSE = False  # Global verbose flag
+FINGERPRINT = False  # When set, stdout is reserved for the machine-readable fingerprint; status goes to stderr
 
 colors = {"RED": "31", "GREEN": "32", "PURP": "34", "DIM": "90", "WHITE": "39"}
 Color = Enum("Color", [(k, f"\033[{v}m") for k, v in colors.items()])
@@ -47,9 +50,18 @@ class CryptoCliException(Exception):
 
 
 def vprint(*args, **kwargs):
-    """Print only if verbose mode is enabled."""
+    """Print only if verbose mode is enabled. Routed to stderr in --fingerprint mode to keep stdout clean."""
     if VERBOSE:
+        if FINGERPRINT:
+            kwargs.setdefault("file", sys.stderr)
         print(*args, **kwargs)
+
+
+def status_print(*args, **kwargs):
+    """Print user-facing status. Routed to stderr in --fingerprint mode so stdout stays machine-readable."""
+    if FINGERPRINT:
+        kwargs.setdefault("file", sys.stderr)
+    print(*args, **kwargs)
 
 
 def get_bytes_from_url(url: str, timeout: int = 10, max_size: int = 1024 * 1024) -> bytes:
@@ -273,7 +285,9 @@ def verify_hostname(cert: X509Certificate, hostname: str) -> None:
 
         for san_name in san_dns_names:
             if _match_hostname(hostname, san_name):
-                print(f"{Color.GREEN.value}✓{Color.WHITE.value} Hostname verified: {hostname} matches SAN {san_name}")
+                status_print(
+                    f"{Color.GREEN.value}✓{Color.WHITE.value} Hostname verified: {hostname} matches SAN {san_name}"
+                )
                 return
     except X509ExtensionNotFound:
         # No SAN extension, fall back to CN
@@ -285,7 +299,7 @@ def verify_hostname(cert: X509Certificate, hostname: str) -> None:
         if cn_attributes:
             cn = cn_attributes[0].value
             if _match_hostname(hostname, cn):
-                print(f"{Color.GREEN.value}✓{Color.WHITE.value} Hostname verified: {hostname} matches CN {cn}")
+                status_print(f"{Color.GREEN.value}✓{Color.WHITE.value} Hostname verified: {hostname} matches CN {cn}")
                 return
     except Exception:
         pass
@@ -362,7 +376,7 @@ class CertStore:
                 raise CryptoCliException("Followed chain to a root CA not present in cacert.pem")
             # Verify self-signature
             verify_certificate_signature(ssl_certificate, ssl_certificate)
-            print(
+            status_print(
                 f"{Color.GREEN.value}✓{Color.WHITE.value} Root CA found and verified: "
                 f"{ssl_certificate.subject.rfc4514_string()}"
             )
@@ -379,8 +393,8 @@ class CertStore:
                 verify_certificate_signature(ssl_certificate, cert)
                 # Verify root CA self-signature
                 verify_certificate_signature(cert, cert)
-                print(f"{Color.GREEN.value}✓{Color.WHITE.value} Root CA found and verified: {root_ca_name}")
-                print(f"{Color.GREEN.value}✓{Color.WHITE.value} Chain signature verification complete")
+                status_print(f"{Color.GREEN.value}✓{Color.WHITE.value} Root CA found and verified: {root_ca_name}")
+                status_print(f"{Color.GREEN.value}✓{Color.WHITE.value} Chain signature verification complete")
                 return
         # Fallback: try matching by public key (handles cross-signed intermediates)
         # If we have a cross-signed intermediate, find the self-signed root with same public key
@@ -506,6 +520,11 @@ def parse_args():
         action="store_true",
         help="Expect the verification to fail (for testing)",
     )
+    host_check_parser.add_argument(
+        "--fingerprint",
+        action="store_true",
+        help="On success, print only the leaf certificate's SHA256 fingerprint (hex) to stdout",
+    )
 
     # get-cacert subcommand
     subparsers.add_parser("get-cacert", help="Download cacert.pem from curl.se")
@@ -529,6 +548,7 @@ crypto - crypto tools
 {D}- {D}crypto host-check hostname[:port] {W}--timeout N     {D}── set connection timeout (default: 4s)
 {D}- {D}crypto host-check hostname[:port] {W}--max-depth N   {D}── set max chain depth (default: 4)
 {D}- {D}crypto host-check hostname[:port] {W}--expect-fail   {D}── expect verification to fail (for testing)
+{D}- {D}crypto host-check hostname[:port] {W}--fingerprint   {D}── on success, print only the SHA256 fingerprint (hex)
 {D}- {W}crypto get-cacert                                 {D}── get cacert.pem from curl.se, used to select a root CA{W}
 ─────────────────────
 Global options:
@@ -539,12 +559,13 @@ Global options:
 
 
 def main():
-    global VERBOSE
+    global VERBOSE, FINGERPRINT
     args = parse_args()
     if not args:
         return 0  # Help was shown, not an error
 
     VERBOSE = args.verbose
+    FINGERPRINT = getattr(args, "fingerprint", False)
 
     if args.command == "get-cacert":
         get_ca_cert_pem()
@@ -557,16 +578,19 @@ def main():
             certificate = get_certificate_from_hostname_and_port(hostname, port, timeout=args.timeout)
             certificate_manager = CertStore(SHARE_PATH / "cacert.pem", args.max_depth, hostname=hostname)
             certificate_manager.start_chain_traversal(certificate)
-            print(f"{Color.GREEN.value}✓ Certificate chain verification complete!")
+            status_print(f"{Color.GREEN.value}✓ Certificate chain verification complete!")
 
             if args.expect_fail:
-                print(f"{Color.RED.value}ERROR: Expected failure but verification succeeded")
+                print(f"{Color.RED.value}ERROR: Expected failure but verification succeeded", file=sys.stderr)
                 return 1
+            # Only emit the fingerprint once verification has fully succeeded, so a hash on stdout is trustworthy.
+            if args.fingerprint:
+                print(certificate.fingerprint(hashes.SHA256()).hex())
             return 0
         except CryptoCliException as e:
             if args.expect_fail:
                 vprint(f"Verification failed as expected: {e}")
-                print(f"{Color.GREEN.value}✓ Failed as expected")
+                status_print(f"{Color.GREEN.value}✓ Failed as expected")
                 return 0
             else:
                 raise  # Re-raise to be caught by main exception handler
@@ -581,7 +605,7 @@ if __name__ == "__main__":
         print("\n  !!  KeyboardInterrupt received  !!  \n")
         exit(130)  # Standard exit code for SIGINT
     except CryptoCliException as e:
-        print(f"{Color.RED.value}\n  !!  {e}  !!  \n")
+        status_print(f"{Color.RED.value}\n  !!  {e}  !!  \n")
         exit(1)  # General error
     except Exception:
         raise

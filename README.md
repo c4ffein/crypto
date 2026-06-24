@@ -18,6 +18,7 @@ crypto - crypto tools
 - crypto host-check hostname[:port] --timeout N     ── set connection timeout (default: 4s)
 - crypto host-check hostname[:port] --max-depth N   ── set max chain depth (default: 4)
 - crypto host-check hostname[:port] --expect-fail   ── expect verification to fail (for testing)
+- crypto host-check hostname[:port] --fingerprint   ── on success, print only the SHA256 fingerprint (hex)
 - crypto get-cacert                                 ── get cacert.pem from curl.se, used to select a root CA
 ─────────────────────
 Global options:
@@ -39,6 +40,9 @@ Global options:
 
 # Verbose mode
 ./crypto.py -v host-check api.anthropic.com
+
+# Print only the verified leaf certificate's SHA256 fingerprint (scriptable)
+./crypto.py host-check api.anthropic.com --fingerprint
 ```
 
 ## What it does
