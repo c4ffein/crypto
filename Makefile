@@ -18,10 +18,10 @@ verify:
 	make lint-check && make test
 
 lint:
-	ruff check --fix; ruff format
+	uvx ruff@0.5.1 check --fix; uvx ruff@0.5.1 format
 
 lint-check:
-	ruff check --no-fix && ruff format --check
+	uvx ruff@0.5.1 check --no-fix && uvx ruff@0.5.1 format --check
 
 test:
 	python3 tests/test.py

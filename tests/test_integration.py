@@ -9,7 +9,6 @@ import sys
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 
 @dataclass
@@ -17,7 +16,7 @@ class TestCase:
     name: str
     host: str
     expect_fail: bool = False
-    max_depth: Optional[int] = None
+    max_depth: int | None = None
 
 
 # Find crypto.py relative to this test file

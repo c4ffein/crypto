@@ -6,7 +6,7 @@ These tests specifically check for vulnerabilities in certificate chain validati
 
 import sys
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from cryptography import x509
@@ -46,8 +46,8 @@ class TestSubjectNameMatchingSecurity(unittest.TestCase):
             .issuer_name(root_subject)  # Self-signed
             .public_key(cls.root_key.public_key())
             .serial_number(1)
-            .not_valid_before(datetime.now(timezone.utc))
-            .not_valid_after(datetime.now(timezone.utc) + timedelta(days=365))
+            .not_valid_before(datetime.now(UTC))
+            .not_valid_after(datetime.now(UTC) + timedelta(days=365))
             .add_extension(
                 x509.SubjectKeyIdentifier.from_public_key(cls.root_key.public_key()),
                 critical=False,
@@ -68,8 +68,8 @@ class TestSubjectNameMatchingSecurity(unittest.TestCase):
             .issuer_name(fake_intermediate_subject)  # Claims to be issued by root
             .public_key(cls.attacker_key.public_key())  # But has attacker's public key
             .serial_number(2)
-            .not_valid_before(datetime.now(timezone.utc))
-            .not_valid_after(datetime.now(timezone.utc) + timedelta(days=365))
+            .not_valid_before(datetime.now(UTC))
+            .not_valid_after(datetime.now(UTC) + timedelta(days=365))
             .add_extension(
                 x509.AuthorityKeyIdentifier.from_issuer_public_key(cls.root_key.public_key()),
                 critical=False,
@@ -143,8 +143,8 @@ class TestSubjectNameMatchingSecurity(unittest.TestCase):
             .issuer_name(self.root_cert.subject)  # Issued by root
             .public_key(intermediate_key.public_key())
             .serial_number(3)
-            .not_valid_before(datetime.now(timezone.utc))
-            .not_valid_after(datetime.now(timezone.utc) + timedelta(days=365))
+            .not_valid_before(datetime.now(UTC))
+            .not_valid_after(datetime.now(UTC) + timedelta(days=365))
             .add_extension(
                 x509.AuthorityKeyIdentifier.from_issuer_public_key(self.root_key.public_key()),
                 critical=False,
@@ -193,8 +193,8 @@ class TestPublicKeyMatchingSecurity(unittest.TestCase):
             .issuer_name(root_subject)  # Self-signed
             .public_key(cls.root_key.public_key())
             .serial_number(1)
-            .not_valid_before(datetime.now(timezone.utc))
-            .not_valid_after(datetime.now(timezone.utc) + timedelta(days=365))
+            .not_valid_before(datetime.now(UTC))
+            .not_valid_after(datetime.now(UTC) + timedelta(days=365))
             .add_extension(
                 x509.SubjectKeyIdentifier.from_public_key(cls.root_key.public_key()),
                 critical=False,
@@ -221,8 +221,8 @@ class TestPublicKeyMatchingSecurity(unittest.TestCase):
             .issuer_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Fake Issuer")]))
             .public_key(cls.root_key.public_key())  # ← COPIED public key from root!
             .serial_number(2)
-            .not_valid_before(datetime.now(timezone.utc))
-            .not_valid_after(datetime.now(timezone.utc) + timedelta(days=365))
+            .not_valid_before(datetime.now(UTC))
+            .not_valid_after(datetime.now(UTC) + timedelta(days=365))
             .add_extension(
                 # AKI that doesn't match the root's SKI (to avoid SKI/AKI matching path)
                 x509.AuthorityKeyIdentifier.from_issuer_public_key(cls.attacker_key.public_key()),
@@ -322,8 +322,8 @@ class TestPublicKeyMatchingSecurity(unittest.TestCase):
             )
             .public_key(leaf_key.public_key())
             .serial_number(100)
-            .not_valid_before(datetime.now(timezone.utc))
-            .not_valid_after(datetime.now(timezone.utc) + timedelta(days=365))
+            .not_valid_before(datetime.now(UTC))
+            .not_valid_after(datetime.now(UTC) + timedelta(days=365))
             .add_extension(
                 x509.SubjectAlternativeName([x509.DNSName("evil.com")]),
                 critical=False,
@@ -381,8 +381,8 @@ class TestPublicKeyMatchingSecurity(unittest.TestCase):
             .issuer_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Fake Issuer")]))
             .public_key(self.root_key.public_key())  # COPIED public key from root!
             .serial_number(999)
-            .not_valid_before(datetime.now(timezone.utc))
-            .not_valid_after(datetime.now(timezone.utc) + timedelta(days=365))
+            .not_valid_before(datetime.now(UTC))
+            .not_valid_after(datetime.now(UTC) + timedelta(days=365))
             .add_extension(
                 x509.SubjectAlternativeName([x509.DNSName("evil.com")]),
                 critical=False,
@@ -444,8 +444,8 @@ class TestCompleteValidChain(unittest.TestCase):
             .issuer_name(root_subject)  # Self-signed
             .public_key(cls.root_key.public_key())
             .serial_number(1)
-            .not_valid_before(datetime.now(timezone.utc))
-            .not_valid_after(datetime.now(timezone.utc) + timedelta(days=3650))  # 10 years
+            .not_valid_before(datetime.now(UTC))
+            .not_valid_after(datetime.now(UTC) + timedelta(days=3650))  # 10 years
             .add_extension(
                 x509.BasicConstraints(ca=True, path_length=2),
                 critical=True,
@@ -487,8 +487,8 @@ class TestCompleteValidChain(unittest.TestCase):
             .issuer_name(root_subject)  # Issued by root
             .public_key(cls.intermediate_key.public_key())
             .serial_number(2)
-            .not_valid_before(datetime.now(timezone.utc))
-            .not_valid_after(datetime.now(timezone.utc) + timedelta(days=1825))  # 5 years
+            .not_valid_before(datetime.now(UTC))
+            .not_valid_after(datetime.now(UTC) + timedelta(days=1825))  # 5 years
             .add_extension(
                 x509.BasicConstraints(ca=True, path_length=0),
                 critical=True,
@@ -534,8 +534,8 @@ class TestCompleteValidChain(unittest.TestCase):
             .issuer_name(intermediate_subject)  # Issued by intermediate
             .public_key(cls.leaf_key.public_key())
             .serial_number(3)
-            .not_valid_before(datetime.now(timezone.utc))
-            .not_valid_after(datetime.now(timezone.utc) + timedelta(days=90))  # 90 days
+            .not_valid_before(datetime.now(UTC))
+            .not_valid_after(datetime.now(UTC) + timedelta(days=90))  # 90 days
             .add_extension(
                 x509.BasicConstraints(ca=False, path_length=None),
                 critical=True,
@@ -631,8 +631,8 @@ class TestCompleteValidChain(unittest.TestCase):
                 .issuer_name(self.leaf_cert.issuer)
                 .public_key(self.leaf_key.public_key())
                 .serial_number(4)
-                .not_valid_before(datetime.now(timezone.utc))
-                .not_valid_after(datetime.now(timezone.utc) + timedelta(days=90))
+                .not_valid_before(datetime.now(UTC))
+                .not_valid_after(datetime.now(UTC) + timedelta(days=90))
                 .add_extension(
                     x509.BasicConstraints(ca=False, path_length=None),
                     critical=True,
@@ -694,8 +694,8 @@ class TestCompleteValidChain(unittest.TestCase):
                         .issuer_name(self.intermediate_cert.issuer)
                         .public_key(self.intermediate_key.public_key())
                         .serial_number(5)
-                        .not_valid_before(datetime.now(timezone.utc))
-                        .not_valid_after(datetime.now(timezone.utc) + timedelta(days=1825))
+                        .not_valid_before(datetime.now(UTC))
+                        .not_valid_after(datetime.now(UTC) + timedelta(days=1825))
                         .add_extension(
                             x509.BasicConstraints(ca=True, path_length=0),
                             critical=True,
@@ -779,8 +779,8 @@ class TestChainSignatureFailure(unittest.TestCase):
             .issuer_name(root_subject)
             .public_key(cls.root_key.public_key())
             .serial_number(1)
-            .not_valid_before(datetime.now(timezone.utc))
-            .not_valid_after(datetime.now(timezone.utc) + timedelta(days=3650))
+            .not_valid_before(datetime.now(UTC))
+            .not_valid_after(datetime.now(UTC) + timedelta(days=3650))
             .add_extension(
                 x509.SubjectKeyIdentifier.from_public_key(cls.root_key.public_key()),
                 critical=False,
@@ -806,8 +806,8 @@ class TestChainSignatureFailure(unittest.TestCase):
             .issuer_name(root_subject)  # Claims to be issued by legitimate root
             .public_key(cls.attacker_key.public_key())
             .serial_number(2)
-            .not_valid_before(datetime.now(timezone.utc))
-            .not_valid_after(datetime.now(timezone.utc) + timedelta(days=1825))
+            .not_valid_before(datetime.now(UTC))
+            .not_valid_after(datetime.now(UTC) + timedelta(days=1825))
             .add_extension(
                 x509.SubjectKeyIdentifier.from_public_key(cls.attacker_key.public_key()),
                 critical=False,
@@ -829,8 +829,8 @@ class TestChainSignatureFailure(unittest.TestCase):
             .issuer_name(intermediate_subject)
             .public_key(cls.leaf_key.public_key())
             .serial_number(3)
-            .not_valid_before(datetime.now(timezone.utc))
-            .not_valid_after(datetime.now(timezone.utc) + timedelta(days=90))
+            .not_valid_before(datetime.now(UTC))
+            .not_valid_after(datetime.now(UTC) + timedelta(days=90))
             .add_extension(
                 x509.SubjectAlternativeName([x509.DNSName("evil.com")]),
                 critical=False,
@@ -934,8 +934,8 @@ class TestChainSignatureFailure(unittest.TestCase):
                 .issuer_name(self.leaf_cert.issuer)
                 .public_key(self.leaf_key.public_key())
                 .serial_number(4)
-                .not_valid_before(datetime.now(timezone.utc))
-                .not_valid_after(datetime.now(timezone.utc) + timedelta(days=90))
+                .not_valid_before(datetime.now(UTC))
+                .not_valid_after(datetime.now(UTC) + timedelta(days=90))
                 .add_extension(
                     x509.SubjectAlternativeName([x509.DNSName("evil.com")]),
                     critical=False,
