@@ -67,7 +67,12 @@ class UpdateTestCase(unittest.TestCase):
         self.get = self.bin / "tls-pin-get"
         self.remote = self.dir / "remote.json"
         self.pins = self.dir / "state" / "crypto" / "pins.json"
-        self.env = {**os.environ, "XDG_STATE_HOME": str(self.dir / "state")}
+        self.config = self.dir / "config" / "crypto" / "tls-pin-update.json"
+        self.env = {
+            **os.environ,
+            "XDG_STATE_HOME": str(self.dir / "state"),
+            "XDG_CONFIG_HOME": str(self.dir / "config"),  # never the one of whoever runs the tests
+        }
         spec = importlib.util.spec_from_file_location("tls_pin_update", self.script)
         self.module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.module)
@@ -94,6 +99,26 @@ class UpdateTestCase(unittest.TestCase):
             stdin.isatty.return_value = True
             code = self.module.main(["tls-pin-update.py", "cat", str(self.remote)])
         return code, stdout.getvalue(), asked
+
+    def configure(self, content):
+        self.config.parent.mkdir(parents=True, exist_ok=True)
+        self.config.write_bytes(content if isinstance(content, bytes) else json.dumps(content).encode())
+
+    def main_without_a_command(self):
+        """Run main() here without arguments nor terminal. FETCH is replaced: the real one is an ssh to a server."""
+        default = [sys.executable, "-c", "import sys; sys.exit(42)"]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.dict(os.environ, self.env),
+            mock.patch.object(self.module, "FETCH", default),
+            mock.patch.object(self.module, "fetch", wraps=self.module.fetch) as fetch,
+            mock.patch.object(self.module.sys, "stdin") as stdin,
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            stdin.isatty.return_value = False
+            code = self.module.main(["tls-pin-update.py"])
+        return code, stdout.getvalue(), stderr.getvalue(), fetch
 
     def seed(self):
         """As if a previous run had generated tls-pin-get: a file that carries the canary"""
@@ -243,6 +268,92 @@ class TestFirstTimeAndCanary(UpdateTestCase):
     def test_directory_in_the_way_is_refused(self):
         self.get.mkdir()
         self.assert_untouched(self.snapshot())
+
+
+class TestConfiguredCommand(UpdateTestCase):
+    """~/.config/crypto/tls-pin-update.json: {"fetch": [...]}, in place of FETCH"""
+
+    def setUp(self):
+        super().setUp()
+        self.seed()
+        self.serve(make_document({"a.test:443": [SHA_A]}))
+        self.cat = ["cat", str(self.remote)]
+
+    def test_config_path_honours_xdg_config_home(self):
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "/etc/xdg-test"}):
+            self.assertEqual(self.module.config_path(), Path("/etc/xdg-test/crypto/tls-pin-update.json"))
+        for ignored in ("", "relative/path"):
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": ignored}):
+                self.assertEqual(self.module.config_path(), Path.home() / ".config/crypto/tls-pin-update.json")
+
+    def test_configured_command_is_run(self):
+        self.configure({"fetch": self.cat})
+        code, stdout, stderr, fetch = self.main_without_a_command()
+        self.assertEqual((code, stderr), (0, ""))
+        fetch.assert_called_once_with(self.cat)
+        self.assertEqual(self.get_pins("a.test").stdout.split(), [SHA_A])
+        self.assertEqual(json.loads(self.config.read_text()), {"fetch": self.cat})  # read-only: left as it was
+
+    def test_without_a_config_file_it_is_the_default(self):
+        code, _, stderr, fetch = self.main_without_a_command()
+        fetch.assert_called_once_with([sys.executable, "-c", "import sys; sys.exit(42)"])
+        self.assertEqual(code, 1)
+        self.assertIn("failed (exit code 42)", stderr)
+
+    def test_arguments_win_and_the_config_is_not_even_read(self):
+        self.configure(b"not json")
+        result = subprocess.run(
+            [sys.executable, "-I", str(self.script), *self.cat],
+            capture_output=True,
+            text=True,
+            env=self.env,
+            stdin=subprocess.DEVNULL,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_arguments_are_run_as_they_are_without_a_shell(self):
+        self.configure({"fetch": [*self.cat, "; touch pwned", "$(touch pwned)"]})
+        code, _, stderr, _ = self.main_without_a_command()
+        self.assertEqual(code, 1)  # cat fails on two files that do not exist
+        self.assertIn("cat failed", stderr)
+        self.assertFalse((self.dir / "pwned").exists())
+        self.assertFalse(Path("pwned").exists())
+
+    def test_config_that_is_not_exactly_that_is_an_error_and_nothing_is_run(self):
+        bad = {
+            "not json": b"fetch = ['ssh']",
+            "nothing": b"",
+            "not utf-8": json.dumps({"fetch": self.cat}).encode("utf-16"),
+            "a list": self.cat,
+            "no fetch": {},
+            "another field": {"fetch": self.cat, "timeout": 5},
+            "another name": {"FETCH": self.cat},
+            "fetch twice": b'{"fetch": ["true"], "fetch": ["cat"]}',
+            "a string, as for a shell": {"fetch": " ".join(self.cat)},
+            "no argument": {"fetch": []},
+            "an empty argument": {"fetch": [*self.cat, ""]},
+            "an argument that is not a string": {"fetch": [*self.cat, 1]},
+            "a nested list": {"fetch": [self.cat]},
+            "an argument with a NUL": {"fetch": [*self.cat, "a\0b"]},
+            "too many arguments": {"fetch": ["true"] * 65},
+            "too large": json.dumps({"fetch": self.cat}).encode() + b" " * (1024 * 1024),
+        }
+        before = self.snapshot()
+        for name, content in bad.items():
+            with self.subTest(name):
+                self.configure(content)
+                code, stdout, stderr, fetch = self.main_without_a_command()
+                self.assertEqual((code, stdout), (1, ""))
+                self.assertIn(f"tls-pin-update: {self.config}: ", stderr)
+                fetch.assert_not_called()  # and above all not the default instead
+                self.assertEqual(self.snapshot(), before)
+
+    def test_config_that_cannot_be_read_is_an_error_too(self):
+        self.config.mkdir(parents=True)  # a directory where the file should be
+        code, _, stderr, fetch = self.main_without_a_command()
+        self.assertEqual(code, 1)
+        self.assertIn("could not read it", stderr)
+        fetch.assert_not_called()
 
 
 class TestValidation(UpdateTestCase):

@@ -17,8 +17,13 @@ Standard library only.
 What it does not do: compare with what this machine is served. It trusts the server's view alone, and ssh (your
 key, the server's line in known_hosts) to bring it back untouched. `crypto pins-update` is the one that compares.
 
-Usage: tls-pin-update.py                (runs FETCH, below)
+Usage: tls-pin-update.py                (runs the configured command)
        tls-pin-update.py command ...    (runs that instead: anything that prints the pins.json)
+
+The configured command is the `fetch` of ~/.config/crypto/tls-pin-update.json (XDG_CONFIG_HOME is honoured), a
+list of arguments run as they are, without a shell:
+  {"fetch": ["ssh", "user@server", "docker", "exec", "cctl-svc-crypto", "cat", "/data/crypto/pins.json"]}
+Without that file it is FETCH, below. A file that is there and is not exactly that is an error: nothing is run.
 """
 
 import json
@@ -29,8 +34,9 @@ import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-# What prints the server's pins.json. `docker exec` and not `cctl service script crypto pins`: a command given to
-# ssh does not get the PATH of a login shell (no ~/.local/bin), nor its aliases.
+# What prints the server's pins.json, when ~/.config/crypto/tls-pin-update.json does not say. `docker exec` and not
+# `cctl service script crypto pins`: a command given to ssh does not get the PATH of a login shell (no
+# ~/.local/bin), nor its aliases.
 FETCH = ["ssh", "debian@p1.c4ffein.io", "docker", "exec", "cctl-svc-crypto", "cat", "/data/crypto/pins.json"]
 FETCH_TIMEOUT = 120  # seconds, a passphrase to type included
 MAX_AGE = timedelta(hours=1)  # the server collects every 5 minutes: older than this, it has stopped
@@ -38,6 +44,7 @@ CLOCK_SKEW = timedelta(minutes=10)
 MAX_BYTES = 1024 * 1024
 MAX_HOSTS = 256
 MAX_PINS_PER_HOST = 16
+MAX_ARGUMENTS = 64  # of a configured command
 
 # The generated script, next to this one as it was called (a symlink is not followed)
 GET_PATH = Path(__file__).absolute().with_name("tls-pin-get")
@@ -50,6 +57,7 @@ HOST_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789.-")
 DIGITS = frozenset("0123456789")
 HEX_CHARS = frozenset("0123456789abcdef")
 
+CONFIG_FIELDS = ("fetch",)
 DOCUMENT_FIELDS = ("version", "generated_at", "hosts")
 HOST_FIELDS = ("checked_at", "pins")
 PIN_FIELDS = ("sha256", "not_after", "first_seen", "last_seen", "source")
@@ -59,6 +67,13 @@ SHELL_SAFE = HOST_CHARS | {":"}  # all a generated line is made of, besides what
 def pins_path() -> Path:
     state_home = os.environ.get("XDG_STATE_HOME", "")
     return (Path(state_home) if state_home.startswith("/") else Path.home() / ".local/state") / "crypto" / "pins.json"
+
+
+def config_path() -> Path:
+    """Read-only: never written by us"""
+    config_home = os.environ.get("XDG_CONFIG_HOME", "")
+    directory = Path(config_home) if config_home.startswith("/") else Path.home() / ".config"
+    return directory / "crypto" / "tls-pin-update.json"
 
 
 def is_valid_host_key(value: object) -> bool:
@@ -136,16 +151,38 @@ def refuse_constant(name: str) -> None:
     raise ValueError(f"{name} is not JSON")
 
 
-def clean_document(raw: bytes, now: datetime) -> dict:
-    """The fetched document, rebuilt from its validated fields alone. ValueError when it is not exactly what
-    pins-collect writes, or not recent: nothing of it is used then."""
+def strict_json(raw: bytes) -> object:
+    """JSON and nothing else: UTF-8, of a bounded size, no duplicate key, no NaN. ValueError otherwise."""
     if len(raw) > MAX_BYTES:
         raise ValueError(f"more than {MAX_BYTES} bytes")
     try:
-        document = json.loads(raw.decode("utf-8"), object_pairs_hook=strict_object, parse_constant=refuse_constant)
+        return json.loads(raw.decode("utf-8"), object_pairs_hook=strict_object, parse_constant=refuse_constant)
     except RecursionError:
         raise ValueError("nested too deep") from None
-    version, generated_at, hosts = fields(document, DOCUMENT_FIELDS, "the document")
+
+
+def configured_fetch(path: Path) -> list[str] | None:
+    """The command of the config file, {"fetch": ["ssh", ...]}. None when there is no file. ValueError when there
+    is one that is not exactly that: a file that is there is never ignored, we do not fall back to FETCH."""
+    try:
+        with path.open("rb") as file:
+            raw = file.read(MAX_BYTES + 1)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError(f"could not read it: {type(exc).__name__}") from None
+    (command,) = fields(strict_json(raw), CONFIG_FIELDS, "the config")
+    if not isinstance(command, list) or not 1 <= len(command) <= MAX_ARGUMENTS:
+        raise ValueError(f"fetch must be a list of 1 to {MAX_ARGUMENTS} arguments")
+    if not all(isinstance(argument, str) and argument and "\0" not in argument for argument in command):
+        raise ValueError("every argument of fetch must be a non-empty string")
+    return command
+
+
+def clean_document(raw: bytes, now: datetime) -> dict:
+    """The fetched document, rebuilt from its validated fields alone. ValueError when it is not exactly what
+    pins-collect writes, or not recent: nothing of it is used then."""
+    version, generated_at, hosts = fields(strict_json(raw), DOCUMENT_FIELDS, "the document")
     if type(version) is not int or version != 1:
         raise ValueError("not a version 1 pins document")
     generated = parse_time(generated_at)
@@ -282,7 +319,11 @@ def main(argv: list[str]) -> int:
     if argv[1:2] in (["-h"], ["--help"]):
         print(__doc__.strip())
         return 0
-    command = argv[1:] or FETCH
+    try:
+        command = argv[1:] or configured_fetch(config_path()) or FETCH
+    except ValueError as exc:
+        print(f"tls-pin-update: {config_path()}: {exc}", file=sys.stderr)
+        return 1
     now = datetime.now(UTC)
     try:
         raw = fetch(command)

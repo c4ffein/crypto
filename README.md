@@ -78,10 +78,10 @@ tools:   tls-pin-update.py      the simple client: one ssh command, strict valid
   default: the collector stopped) or older than the stored ones. For each host it then verifies what this
   machine is served. When that certificate is not one the server saw, it says so and asks whether to trust it as
   well; no terminal means no, and the exit code is 1. What you approve is kept until its certificate expires.
-- **`tools/tls-pin-update.py`** is the simple client, for when comparing is not wanted: one ssh command (edit
-  `FETCH` at its top, or pass a command) and a validation of what it prints, in plain Python: the exact schema
-  that `pins-collect` writes (an unknown or missing field, a duplicate key, a wrong type, a timestamp that is not
-  in the one format: all refused), size limits, and fresh (an hour). It trusts the server's view alone. Then it
+- **`tools/tls-pin-update.py`** is the simple client, for when comparing is not wanted: one ssh command (the
+  `fetch` of `~/.config/crypto/tls-pin-update.json`, or the arguments it is given) and a validation of what it
+  prints, in plain Python: the exact schema that `pins-collect` writes (an unknown or missing field, a duplicate
+  key, a wrong type, a timestamp that is not in the one format: all refused), size limits, and fresh (an hour). It trusts the server's view alone. Then it
   writes `pins.json`, and generates `tls-pin-get` next to itself. Standard library only: copy it to
   `~/.local/bin`.
 - **`tls-pin-get`** is that generated file: a POSIX shell script with the pins in it, as a `case` of the hosts,
@@ -176,9 +176,17 @@ command="/full/path/to/containerctl service script crypto pins",restrict ssh-ed2
 Or the simple client, without `crypto.py` nor `cryptography` on this machine:
 
 ```bash
-cp tools/tls-pin-update.py ~/.local/bin/     # then edit FETCH at its top
+cp tools/tls-pin-update.py ~/.local/bin/
 tls-pin-update.py                            # the first time: asks before creating ~/.local/bin/tls-pin-get
 tls-pin-get api.anthropic.com                # one fingerprint per line
+```
+
+What it runs comes from `~/.config/crypto/tls-pin-update.json` (or from its arguments: `tls-pin-update.py cat
+some-pins.json`). It is an argv, never a shell line. Without that file, it is the `FETCH` at the top of the script;
+a file that is there but is not exactly this is an error, and nothing is run then.
+
+```json
+{"fetch": ["ssh", "user@server", "docker", "exec", "cctl-svc-crypto", "cat", "/data/crypto/pins.json"]}
 ```
 
 ## What it does
