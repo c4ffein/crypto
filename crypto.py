@@ -1082,7 +1082,7 @@ Global options:
 Files (XDG_CONFIG_HOME, XDG_STATE_HOME, XDG_DATA_HOME are honoured):
   ~/.config/crypto/config.toml                      {D}── hosts = [...] and / or remote_command = [...]{W}
   CRYPTO_HOSTS="a.example b.example:993"            {D}── the hosts, in place of config.toml (a container){W}
-  ~/.local/state/crypto/pins.json                   {D}── the pins: get_tls_pin.py reads them for other tools{W}
+  ~/.local/state/crypto/pins.json                   {D}── the pins, for other tools to read{W}
   ~/.local/share/c4ffein-crypto-cli/cacert.pem      {D}── the root CAs{W}
 """
     print(help_text)

@@ -33,7 +33,7 @@ Global options:
 Files (XDG_CONFIG_HOME, XDG_STATE_HOME, XDG_DATA_HOME are honoured):
   ~/.config/crypto/config.toml                      ── hosts = [...] and / or remote_command = [...]
   CRYPTO_HOSTS="a.example b.example:993"            ── the hosts, in place of config.toml (a container)
-  ~/.local/state/crypto/pins.json                   ── the pins: get_tls_pin.py reads them for other tools
+  ~/.local/state/crypto/pins.json                   ── the pins, for other tools to read
   ~/.local/share/c4ffein-crypto-cli/cacert.pem      ── the root CAs
 ```
 
@@ -65,7 +65,8 @@ the pins here come from a second vantage point (a server of yours), and are comp
 ```
 server:  crypto pins-collect    verifies its hosts (CRYPTO_HOSTS or config.toml), merges what they serve into pins.json
 client:  crypto pins-update     runs remote_command (ssh ... cat pins.json), validates, cross-checks, stores
-tools:   get_tls_pin.py host    prints the stored fingerprints of a host, one per line
+tools:   tls-pin-update.py      the simple client: one ssh command, strict validation, generates tls-pin-get
+         tls-pin-get host       (generated) prints the fingerprints of a host, one per line, in a millisecond
 ```
 
 - **`pins-collect`** keeps a set of pins per host (the old and the new certificate overlap during a rotation),
@@ -77,10 +78,24 @@ tools:   get_tls_pin.py host    prints the stored fingerprints of a host, one pe
   default: the collector stopped) or older than the stored ones. For each host it then verifies what this
   machine is served. When that certificate is not one the server saw, it says so and asks whether to trust it as
   well; no terminal means no, and the exit code is 1. What you approve is kept until its certificate expires.
-- **`get_tls_pin.py`** is separate on purpose: standard library only, no network, read-only, about 40 ms. Exit
-  code 0 with at least one fingerprint, 1 with none (unknown host, no file, everything expired), 2 on a bad call.
-  A tool calling it should use an argv (no shell), check that every line is 64 hex chars, accept any of them, and
-  refuse to connect when there is none.
+- **`tools/tls-pin-update.py`** is the simple client, for when comparing is not wanted: one ssh command (edit
+  `FETCH` at its top, or pass a command) and a validation of what it prints, in plain Python: the exact schema
+  that `pins-collect` writes (an unknown or missing field, a duplicate key, a wrong type, a timestamp that is not
+  in the one format: all refused), size limits, and fresh (an hour). It trusts the server's view alone. Then it
+  writes `pins.json`, and generates `tls-pin-get` next to itself. Standard library only: copy it to
+  `~/.local/bin`.
+- **`tls-pin-get`** is that generated file: a POSIX shell script with the pins in it, as a `case` of the hosts,
+  because the tools that need a pin start in a few milliseconds and a Python process is 40 more. Exit code 0 with
+  at least one fingerprint, 1 with none (unknown host, everything expired), 2 on a bad call. A tool calling it
+  should use an argv (no shell), check that every line is 64 hex chars, accept any of them, and refuse to
+  connect when there is none.
+  - It is code written from data, hence the rules: only validated values go in, and only characters that mean
+    nothing to a shell (`a-z 0-9 . - :`), checked a second time by the generator.
+  - The first time, the updater says what it is about to create and asks; without a terminal it creates
+    nothing. Afterwards it overwrites the file only when it carries its canary (a fixed UUID in a comment): a
+    file of that name that is not its own, or a symlink, is never touched, and the run fails.
+  - It is a snapshot: the pins of the last update, without those that had already expired then. Run the
+    updater from a timer to keep it fresh.
 
 ### Server, as a [containerctl](https://github.com/c4ffein/containerctl) service
 
@@ -156,6 +171,14 @@ A key that only reads the pins: on the server, in `~/.ssh/authorized_keys`, with
 
 ```
 command="/full/path/to/containerctl service script crypto pins",restrict ssh-ed25519 AAAA... crypto-pins
+```
+
+Or the simple client, without `crypto.py` nor `cryptography` on this machine:
+
+```bash
+cp tools/tls-pin-update.py ~/.local/bin/     # then edit FETCH at its top
+tls-pin-update.py                            # the first time: asks before creating ~/.local/bin/tls-pin-get
+tls-pin-get api.anthropic.com                # one fingerprint per line
 ```
 
 ## What it does

@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Tests for the pins commands (pins-collect, pins-update) and for get_tls_pin.py, which reads what they write.
+Tests for the pins commands (pins-collect, pins-update) and for what tools/tls-pin-update.py makes of what they write.
 Offline: the verification of a host is replaced by a dict of what each host "serves", and the remote command
 is a local process printing a file.
 """
 
 import fcntl
+import importlib.util
 import json
 import os
+import shutil
 import signal
 import stat
 import subprocess
@@ -27,10 +29,14 @@ from cryptography.x509.oid import NameOID
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import crypto
-import get_tls_pin
 from crypto import CryptoCliException
 
-GET_TLS_PIN = Path(__file__).parent.parent / "get_tls_pin.py"
+ROOT = Path(__file__).parent.parent
+TLS_PIN_UPDATE = ROOT / "tools" / "tls-pin-update.py"
+# Not a module name (it is a script, called by its file name): loaded from its path, to test its functions too
+tls_pin_update_spec = importlib.util.spec_from_file_location("tls_pin_update", TLS_PIN_UPDATE)
+tls_pin_update = importlib.util.module_from_spec(tls_pin_update_spec)
+tls_pin_update_spec.loader.exec_module(tls_pin_update)
 KEY = ec.generate_private_key(ec.SECP256R1())
 
 
@@ -361,7 +367,7 @@ class TestPinsWatchProcess(unittest.TestCase):
             (root / "data" / "c4ffein-crypto-cli").mkdir(parents=True)
             (root / "data" / "c4ffein-crypto-cli" / "cacert.pem").write_text("recent enough\n")
             dirs = {f"XDG_{name}_HOME": str(root / name.lower()) for name in ("CONFIG", "DATA", "STATE")}
-            command = [sys.executable, str(GET_TLS_PIN.with_name("crypto.py")), "pins-collect", "--watch", "5"]
+            command = [sys.executable, str(ROOT / "crypto.py"), "pins-collect", "--watch", "5"]
             process = subprocess.Popen(
                 command, env={**os.environ, **dirs}, stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
@@ -591,17 +597,17 @@ class TestXdgDirs(unittest.TestCase):
     def test_absolute_variable_is_used(self):
         with mock.patch.dict(os.environ, {"XDG_STATE_HOME": "/data"}):
             self.assertEqual(crypto.xdg_dir("XDG_STATE_HOME", ".local/state"), Path("/data"))
-            self.assertEqual(get_tls_pin.pins_path(), Path("/data/crypto/pins.json"))
+            self.assertEqual(tls_pin_update.pins_path(), Path("/data/crypto/pins.json"))
 
     def test_relative_or_empty_variable_is_ignored(self):
         for value in ("relative/dir", ""):
             with mock.patch.dict(os.environ, {"XDG_STATE_HOME": value}):
                 self.assertEqual(crypto.xdg_dir("XDG_STATE_HOME", ".local/state"), Path.home() / ".local/state")
-                self.assertEqual(get_tls_pin.pins_path(), Path.home() / ".local/state/crypto/pins.json")
+                self.assertEqual(tls_pin_update.pins_path(), Path.home() / ".local/state/crypto/pins.json")
 
     def test_reader_and_writer_agree_on_the_format(self):
-        self.assertEqual(get_tls_pin.TIME_FORMAT, crypto.TIME_FORMAT)
-        for module in (crypto, get_tls_pin):
+        self.assertEqual(tls_pin_update.TIME_FORMAT, crypto.TIME_FORMAT)
+        for module in (crypto, tls_pin_update):
             for name in ("HOST_CHARS", "DIGITS", "HEX_CHARS"):
                 self.assertEqual(getattr(module, name), getattr(crypto, name), name)
 
@@ -633,7 +639,7 @@ class TestXdgDirs(unittest.TestCase):
             443,
             ["a.test:443"],
         )
-        for module in (crypto, get_tls_pin):
+        for module in (crypto, tls_pin_update):
             for value in good:
                 self.assertTrue(module.is_valid_host_key(value), (module.__name__, value))
             for value in bad:
@@ -654,66 +660,42 @@ class TestXdgDirs(unittest.TestCase):
             ["a"] * 64,
             b"a" * 64,
         )
-        for module in (crypto, get_tls_pin):
+        for module in (crypto, tls_pin_update):
             for value in good:
                 self.assertTrue(module.is_valid_sha256(value), (module.__name__, value))
             for value in bad:
                 self.assertFalse(module.is_valid_sha256(value), (module.__name__, value))
 
 
-class TestGetTlsPin(PinsTestCase):
-    """get_tls_pin.py as another tool runs it: a process, pointed at a pins file written by crypto"""
+class TestToolsContract(PinsTestCase):
+    """What crypto pins-collect writes on the server is exactly what tools/tls-pin-update.py accepts, strict as it
+    is, and the tls-pin-get it generates prints those pins"""
 
-    def run_getter(self, *args):
-        env = {**os.environ, "XDG_STATE_HOME": str(self.dir / "state")}
-        return subprocess.run([sys.executable, "-I", str(GET_TLS_PIN), *args], capture_output=True, text=True, env=env)
+    def test_collected_pins_reach_the_generated_script(self):
+        a, old_b, new_b = make_cert(), make_cert(), make_cert()
+        self.write_config(hosts=["a.test", "b.test:993", "down.test"])
+        self.served = {"a.test:443": a, "b.test:993": old_b, "down.test:443": CryptoCliException("Connection refused")}
+        self.collect()
+        self.served["b.test:993"] = new_b  # a rotation: two pins for that host
+        self.assertEqual(self.collect(), 1)  # down.test never verified: an entry without a pin
 
-    def test_prints_every_valid_pin_of_the_host(self):
-        old, new, other = make_cert(), make_cert(), make_cert()
-        self.write_remote(make_document({"a.test:443": [old, new], "b.test:993": [other]}))
-        self.update(local_check=False)
-        for target in ("a.test", "a.test:443", "A.TEST"):
-            result = self.run_getter(target)
-            self.assertEqual((result.returncode, result.stdout.split()), (0, [sha(old), sha(new)]), target)
-        self.assertEqual(self.run_getter("b.test:993").stdout.split(), [sha(other)])
+        bin_dir = self.dir / "bin"
+        bin_dir.mkdir()
+        script = shutil.copy(TLS_PIN_UPDATE, bin_dir / "tls-pin-update.py")
+        (bin_dir / "tls-pin-get").write_text(f"#!/bin/sh\n# {tls_pin_update.CANARY}\n")  # as generated before
+        env = {**os.environ, "XDG_STATE_HOME": str(self.dir / "client-state")}
+        command = [sys.executable, "-I", script, "cat", str(self.pins_path)]
+        result = subprocess.run(command, capture_output=True, text=True, env=env, stdin=subprocess.DEVNULL)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_approved_pin_is_printed_too(self):
-        remote, here = make_cert(), make_cert()
-        self.write_remote(make_document({"a.test:443": [remote]}))
-        self.served = {"a.test:443": here}
-        with mock.patch.object(crypto, "confirm", return_value=True):
-            self.update()
-        self.assertEqual(self.run_getter("a.test").stdout.split(), [sha(remote), sha(here)])
+        def get(target):
+            got = subprocess.run(["sh", str(bin_dir / "tls-pin-get"), target], capture_output=True, text=True)
+            return got.returncode, got.stdout.split()
 
-    def test_pin_that_expired_since_the_update_is_not_printed(self):
-        expired, current = make_cert(expires_in_days=-1), make_cert()
-        crypto.store_pins(make_document({"a.test:443": [expired, current], "b.test:443": [expired]}))
-        self.assertEqual(self.run_getter("a.test").stdout.split(), [sha(current)])
-        result = self.run_getter("b.test")
-        self.assertEqual((result.returncode, result.stdout), (1, ""))
-
-    def test_nothing_to_print_is_exit_code_one(self):
-        result = self.run_getter("a.test")  # no pins file at all
-        self.assertEqual((result.returncode, result.stdout), (1, ""))
-        crypto.store_pins(make_document({"a.test:443": [make_cert()]}))
-        for target in ("b.test", "a.test:8443"):  # another host, another port
-            result = self.run_getter(target)
-            self.assertEqual((result.returncode, result.stdout), (1, ""), target)
-
-    def test_unusable_pins_file_is_exit_code_one(self):
-        self.pins_path.parent.mkdir(parents=True)
-        document = make_document({"a.test:443": [make_cert()]})
-        document["hosts"]["a.test:443"]["pins"][0]["sha256"] = "not a fingerprint"
-        for content in ("", "[]", "{}", '{"version": 2, "hosts": {}}', json.dumps(document)):
-            self.pins_path.write_text(content)
-            result = self.run_getter("a.test")
-            self.assertEqual((result.returncode, result.stdout), (1, ""), content)
-            self.assertNotIn("Traceback", result.stderr)
-
-    def test_bad_call_is_exit_code_two(self):
-        for args in ((), ("a.test", "b.test"), ("a b",), ("../../etc/passwd",), ("a.test:port",), ("--help",)):
-            result = self.run_getter(*args)
-            self.assertEqual((result.returncode, result.stdout), (2, ""), args)
+        self.assertEqual(get("a.test"), (0, [sha(a)]))
+        self.assertEqual(get("b.test:993"), (0, [sha(old_b), sha(new_b)]))
+        self.assertEqual(get("down.test"), (1, []))
+        self.assertEqual(json.loads((self.dir / "client-state/crypto/pins.json").read_text()), self.stored())
 
 
 if __name__ == "__main__":

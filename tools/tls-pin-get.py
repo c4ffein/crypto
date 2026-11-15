@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 
 """
-get_tls_pin - print the pinned TLS certificate fingerprints of a host
+tls-pin-get - print the pinned TLS certificate fingerprints of a host
 MIT License - Copyright (c) 2026 c4ffein
 
 I wouldn't recommend to use this if you are not aware of the security implications
 
-The reading half of `crypto pins-update`: standard library only, no network, read-only, so that another tool can
-call it right before it connects. It trusts the pins file as it trusts its own config (same user, same disk):
-everything that had to be verified was verified by crypto when it wrote the file.
+The reading half of tls-pin-update.py and of `crypto pins-update`: standard library only, no network, read-only,
+so that another tool can call it right before it connects. It trusts the pins file as it trusts its own config
+(same user, same disk): everything that had to be verified was verified by whoever wrote the file.
 
-Usage: get_tls_pin.py hostname[:port]   (default port: 443)
+Usage: tls-pin-get.py hostname[:port]   (default port: 443)
 - prints the SHA-256 (64 hex chars) of every certificate pinned for that host and not expired, one per line
 - exit code 0 when there is at least one, 1 when there is none (and nothing on stdout), 2 on a bad call
 A host has a set of pins, not one: the old and the new certificate overlap during a rotation. Accept any of them.
@@ -81,20 +81,20 @@ def main(argv: list[str]) -> int:
         return 2
     key = host_key(argv[1])
     if key is None:
-        print("get_tls_pin: invalid host (hostname[:port])", file=sys.stderr)
+        print("tls-pin-get: invalid host (hostname[:port])", file=sys.stderr)
         return 2
     path = pins_path()
     try:
         with path.open("rb") as file:
             pins = live_pins(json.load(file), key, datetime.now(UTC))
     except FileNotFoundError:
-        print(f"get_tls_pin: no pins file ({path}): run `crypto pins-update`", file=sys.stderr)
+        print(f"tls-pin-get: no pins file ({path}): run tls-pin-update.py (or `crypto pins-update`)", file=sys.stderr)
         return 1
     except (OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError) as exc:
-        print(f"get_tls_pin: unusable pins file ({path}): {type(exc).__name__}", file=sys.stderr)
+        print(f"tls-pin-get: unusable pins file ({path}): {type(exc).__name__}", file=sys.stderr)
         return 1
     if not pins:
-        print(f"get_tls_pin: no valid pin for {key}: run `crypto pins-update`", file=sys.stderr)
+        print(f"tls-pin-get: no valid pin for {key}: run tls-pin-update.py (or `crypto pins-update`)", file=sys.stderr)
         return 1
     print("\n".join(pins))
     return 0
