@@ -90,6 +90,10 @@ class PinsTestCase(unittest.TestCase):
         silence = mock.patch.multiple(sys, stdout=mock.DEFAULT, stderr=mock.DEFAULT)
         silence.start()
         self.addCleanup(silence.stop)
+        environ = mock.patch.dict(os.environ)  # whatever a test sets is undone; the hosts come from the config
+        environ.start()
+        self.addCleanup(environ.stop)
+        os.environ.pop("CRYPTO_HOSTS", None)
 
     def verify_host(self, target, timeout=None, max_depth=None):
         served = self.served[target]
@@ -199,6 +203,40 @@ class TestPinsCollect(PinsTestCase):
             with self.assertRaisesRegex(CryptoCliException, "Missing or invalid 'hosts'"):
                 self.collect()
         self.write_config(hosts=["a.test/../../x"])
+        with self.assertRaisesRegex(CryptoCliException, "Invalid host"):
+            self.collect()
+        self.assertFalse(self.pins_path.exists())
+
+
+class TestHostsFromTheEnvironment(PinsTestCase):
+    """CRYPTO_HOSTS: all a container needs, no config file"""
+
+    def test_hosts_of_the_variable_are_collected_without_a_config_file(self):
+        a, b, c = make_cert(), make_cert(), make_cert()
+        self.served = {"a.test:443": a, "b.test:993": b, "c.test:443": c}
+        for value in ("a.test b.test:993 c.test", "a.test,b.test:993,c.test", "\n  a.test\n  b.test:993\n  c.test\n"):
+            os.environ["CRYPTO_HOSTS"] = value
+            self.assertEqual(self.collect(), 0, value)
+            self.assertEqual(list(self.stored()["hosts"]), ["a.test:443", "b.test:993", "c.test:443"], value)
+        self.assertFalse(self.config_path.exists())
+
+    def test_variable_wins_over_the_config_file(self):
+        self.write_config(hosts=["a.test"])
+        self.served = {"b.test:443": make_cert()}
+        os.environ["CRYPTO_HOSTS"] = "b.test"
+        self.assertEqual(self.collect(), 0)
+        self.assertEqual(list(self.stored()["hosts"]), ["b.test:443"])
+
+    def test_variable_that_lists_nothing_is_an_error_not_a_fallback(self):
+        self.write_config(hosts=["a.test"])
+        for value in ("", "  \n ", ","):
+            os.environ["CRYPTO_HOSTS"] = value
+            with self.assertRaisesRegex(CryptoCliException, "CRYPTO_HOSTS is set but lists no host"):
+                self.collect()
+        self.assertFalse(self.pins_path.exists())
+
+    def test_invalid_host_in_the_variable_is_refused(self):
+        os.environ["CRYPTO_HOSTS"] = "a.test ../../etc/passwd"
         with self.assertRaisesRegex(CryptoCliException, "Invalid host"):
             self.collect()
         self.assertFalse(self.pins_path.exists())

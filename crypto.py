@@ -59,6 +59,7 @@ def xdg_dir(variable: str, default: str) -> Path:
 SHARE_PATH = xdg_dir("XDG_DATA_HOME", ".local/share") / "c4ffein-crypto-cli"  # cacert.pem: downloaded, replaceable
 CONFIG_PATH = xdg_dir("XDG_CONFIG_HOME", ".config") / "crypto" / "config.toml"  # read-only: never written by us
 PINS_PATH = xdg_dir("XDG_STATE_HOME", ".local/state") / "crypto" / "pins.json"  # ours: we are its only writer
+HOSTS_VARIABLE = "CRYPTO_HOSTS"  # the hosts of pins-collect, in place of the config file: all a container needs
 
 MAX_DEPTH = 4
 TIMEOUT = 4
@@ -718,6 +719,18 @@ def clean_host(key: str, entry: Any, trust_source: bool) -> dict:
     return {"checked_at": checked_at, "pins": [clean_pin(pin, key, trust_source) for pin in pins]}
 
 
+def configured_hosts() -> list[str]:
+    """The hosts pins-collect verifies, as hostname[:port]: what CRYPTO_HOSTS lists when it is set (separated by
+    spaces, newlines or commas), so that a container needs no config file; else `hosts` of the config file."""
+    value = os.environ.get(HOSTS_VARIABLE)
+    if value is None:
+        return load_config_list("hosts")
+    targets = value.replace(",", " ").split()
+    if not targets:
+        raise CryptoCliException(f"{HOSTS_VARIABLE} is set but lists no host")
+    return targets
+
+
 def parse_pins(raw: bytes, origin: str, trust_source: bool) -> dict:
     """Parse a pins document, strictly: what is not exactly what we write is refused, and what comes back is rebuilt
     from the validated fields alone (clean_*: they raise ValueError). `trust_source` is for our own file: a remote
@@ -795,12 +808,12 @@ def pins_lock():
 
 @pins_lock()
 def collect_round(timeout: int, max_depth: int, quiet: bool = False) -> dict[str, int]:
-    """Verify every host of the config and merge what it serves into our pins file. A host that fails keeps the pins
+    """Verify every configured host and merge what it serves into our pins file. A host that fails keeps the pins
     it had (and its old `checked_at`, which is how a reader knows). `quiet` leaves out the hosts with nothing new.
     Returns how many hosts were verified, how many of those served a certificate not seen before, how many failed."""
-    keys = list(dict.fromkeys(host_key(target) for target in load_config_list("hosts")))
+    keys = list(dict.fromkeys(host_key(target) for target in configured_hosts()))
     if len(keys) > PINS_MAX_HOSTS:
-        raise CryptoCliException(f"More than {PINS_MAX_HOSTS} hosts in {CONFIG_PATH}")
+        raise CryptoCliException(f"More than {PINS_MAX_HOSTS} hosts to verify")
     previous = (load_pins() or {"hosts": {}})["hosts"]
     now = datetime.now(UTC)
     document = {"version": PINS_VERSION, "generated_at": format_time(now), "hosts": {}}
@@ -1056,7 +1069,7 @@ crypto - crypto tools
 {D}- {D}crypto host-check hostname[:port] {W}--expect-fail   {D}── expect verification to fail (for testing)
 {D}- {D}crypto host-check hostname[:port] {W}--fingerprint   {D}── on success, print only the SHA256 fingerprint (hex)
 {D}- {W}crypto get-cacert                                 {D}── get cacert.pem from curl.se, used to select a root CA
-{D}- {W}crypto pins-collect                               {D}── server: verify config.toml's hosts into pins.json
+{D}- {W}crypto pins-collect                               {D}── server: verify the configured hosts into pins.json
 {D}- {D}crypto pins-collect {W}--watch N                     {D}── every N minutes (default: 5), cacert.pem every day
 {D}- {W}crypto pins-update                                {D}── client: fetch them (remote_command), check, store
 {D}- {D}crypto pins-update {W}--max-age N                    {D}── refuse pins older than N hours (default: 48)
@@ -1068,6 +1081,7 @@ Global options:
 ─────────────────────
 Files (XDG_CONFIG_HOME, XDG_STATE_HOME, XDG_DATA_HOME are honoured):
   ~/.config/crypto/config.toml                      {D}── hosts = [...] and / or remote_command = [...]{W}
+  CRYPTO_HOSTS="a.example b.example:993"            {D}── the hosts, in place of config.toml (a container){W}
   ~/.local/state/crypto/pins.json                   {D}── the pins: get_tls_pin.py reads them for other tools{W}
   ~/.local/share/c4ffein-crypto-cli/cacert.pem      {D}── the root CAs{W}
 """

@@ -20,7 +20,7 @@ crypto - crypto tools
 - crypto host-check hostname[:port] --expect-fail   ── expect verification to fail (for testing)
 - crypto host-check hostname[:port] --fingerprint   ── on success, print only the SHA256 fingerprint (hex)
 - crypto get-cacert                                 ── get cacert.pem from curl.se, used to select a root CA
-- crypto pins-collect                               ── server: verify config.toml's hosts into pins.json
+- crypto pins-collect                               ── server: verify the configured hosts into pins.json
 - crypto pins-collect --watch N                     ── every N minutes (default: 5), cacert.pem every day
 - crypto pins-update                                ── client: fetch them (remote_command), check, store
 - crypto pins-update --max-age N                    ── refuse pins older than N hours (default: 48)
@@ -32,6 +32,7 @@ Global options:
 ─────────────────────
 Files (XDG_CONFIG_HOME, XDG_STATE_HOME, XDG_DATA_HOME are honoured):
   ~/.config/crypto/config.toml                      ── hosts = [...] and / or remote_command = [...]
+  CRYPTO_HOSTS="a.example b.example:993"            ── the hosts, in place of config.toml (a container)
   ~/.local/state/crypto/pins.json                   ── the pins: get_tls_pin.py reads them for other tools
   ~/.local/share/c4ffein-crypto-cli/cacert.pem      ── the root CAs
 ```
@@ -62,7 +63,7 @@ Leaf certificates rotate every few weeks, and a pin refreshed from whatever the 
 the pins here come from a second vantage point (a server of yours), and are compared with what this machine sees.
 
 ```
-server:  crypto pins-collect    verifies the hosts of its config.toml, merges what they serve into its pins.json
+server:  crypto pins-collect    verifies its hosts (CRYPTO_HOSTS or config.toml), merges what they serve into pins.json
 client:  crypto pins-update     runs remote_command (ssh ... cat pins.json), validates, cross-checks, stores
 tools:   get_tls_pin.py host    prints the stored fingerprints of a host, one per line
 ```
@@ -83,27 +84,69 @@ tools:   get_tls_pin.py host    prints the stored fingerprints of a host, one pe
 
 ### Server, as a [containerctl](https://github.com/c4ffein/containerctl) service
 
-`deploy/` holds the files. Nothing listens: the container runs `pins-collect --watch 5`, and is unhealthy (an
-issue in containerctl) when the pins have not been written for 20 minutes.
+Three small files and nothing else: no config file, no build context. The hosts are an environment variable of
+the service (`CRYPTO_HOSTS`: hostname[:port], separated by spaces, newlines or commas), `crypto.py` is fetched at
+build time. Nothing listens: the container runs `pins-collect --watch 5`.
+
+```toml
+# ~/.config/containerctl/images/crypto.toml
+tag = "crypto:latest"
+```
+
+```dockerfile
+# ~/.config/containerctl/images/crypto.Dockerfile
+FROM python:3.13-alpine
+# Replace `main` by a commit hash to pin what runs here
+ADD https://raw.githubusercontent.com/c4ffein/crypto/main/crypto.py /app/crypto.py
+RUN chmod 644 /app/crypto.py \
+    && pip install --no-cache-dir "cryptography>=42" \
+    && adduser -D -u 1000 crypto \
+    && mkdir -p /data \
+    && chown crypto:crypto /data
+USER crypto
+# cacert.pem and pins.json both go to the volume: the root filesystem is read-only
+ENV XDG_DATA_HOME=/data XDG_STATE_HOME=/data
+CMD ["python3", "/app/crypto.py", "pins-collect", "--watch", "5"]
+```
+
+```toml
+# ~/.config/containerctl/services/crypto.toml
+image = "crypto:latest"
+restart = "unless-stopped"
+volumes = ["crypto-data:/data"]            # cacert.pem and pins.json: outlive the container
+command = ["python3", "/app/crypto.py", "pins-collect", "--watch", "5"]
+read_only = true
+tmpfs = ["/tmp"]
+cap_drop = ["ALL"]
+no_new_privileges = true
+pids_limit = 64
+memory = "256m"
+# Unhealthy (an issue) when the pins have not been written for 20 minutes: 4 rounds missed
+health_cmd = "python3 -c \"import os, sys, time; sys.exit(time.time() - os.stat('/data/crypto/pins.json').st_mtime > 1200)\""
+health_interval = "5m"
+health_start_period = "2m"
+
+[scripts]
+pins = ["cat", "/data/crypto/pins.json"]   # what a client reads
+
+[env]
+# `containerctl service recreate crypto` after an edit
+CRYPTO_HOSTS = """
+api.anthropic.com
+smtp.gmail.com:465
+"""
+```
 
 ```bash
-mkdir -p ~/.config/crypto ~/.config/containerctl/images/crypto
-cp deploy/crypto/config.toml ~/.config/crypto/config.toml               # the hosts
-cp deploy/containerctl/images/crypto.* ~/.config/containerctl/images/
-cp crypto.py ~/.config/containerctl/images/crypto/                      # the build context
-cp deploy/containerctl/services/crypto.toml ~/.config/containerctl/services/
 containerctl image build crypto && containerctl service up crypto
 containerctl logs cctl-svc-crypto            # one line per round
 containerctl service script crypto pins      # what a client reads
 ```
 
-In the container, `XDG_DATA_HOME` and `XDG_STATE_HOME` point at the volume and `XDG_CONFIG_HOME` at the
-read-only config: the root filesystem stays read-only.
-
 ### Client
 
 ```toml
-# ~/.config/crypto/config.toml (see deploy/crypto/config.client.toml)
+# ~/.config/crypto/config.toml
 remote_command = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "debian@server",
                   "containerctl", "service", "script", "crypto", "pins"]
 ```
