@@ -5,12 +5,15 @@ Offline: the verification of a host is replaced by a dict of what each host "ser
 is a local process printing a file.
 """
 
+import fcntl
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -199,6 +202,148 @@ class TestPinsCollect(PinsTestCase):
         with self.assertRaisesRegex(CryptoCliException, "Invalid host"):
             self.collect()
         self.assertFalse(self.pins_path.exists())
+
+
+class TestPinsLock(PinsTestCase):
+    def hold_the_lock(self):
+        self.pins_path.parent.mkdir(parents=True, exist_ok=True)
+        holder = self.pins_path.with_name("pins.lock").open("w")
+        self.addCleanup(holder.close)
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return holder
+
+    def test_second_writer_is_refused(self):
+        cert = make_cert()
+        self.write_remote(make_document({"a.test:443": [cert]}))
+        self.write_config(hosts=["a.test"], remote_command=["true"])
+        self.served = {"a.test:443": cert}
+        self.hold_the_lock()
+        with self.assertRaisesRegex(CryptoCliException, "Another crypto is writing the pins"):
+            self.collect()
+        with self.assertRaisesRegex(CryptoCliException, "Another crypto is writing the pins"):
+            self.update()
+        self.assertFalse(self.pins_path.exists())
+
+    def test_lock_is_released_after_a_run_and_after_a_failure(self):
+        self.write_config(hosts=["a.test"])
+        self.served = {"a.test:443": make_cert()}
+        self.assertEqual(self.collect(), 0)
+        self.assertEqual(self.collect(), 0)
+        self.config_path.unlink()
+        with self.assertRaisesRegex(CryptoCliException, "Config not found"):
+            self.collect()
+        self.write_config(hosts=["a.test"])
+        self.assertEqual(self.collect(), 0)
+
+
+class TestPinsWatch(PinsTestCase):
+    """The loop itself: time.sleep is what ends it here (SystemExit, as SIGTERM does), after a number of rounds"""
+
+    def setUp(self):
+        super().setUp()
+        self.cacert = self.dir / "data" / "cacert.pem"
+        self.downloads = 0
+        for name, value in (("SHARE_PATH", self.cacert.parent), ("get_ca_cert_pem", self.download_cacert)):
+            patcher = mock.patch.object(crypto, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.addCleanup(signal.signal, signal.SIGTERM, signal.getsignal(signal.SIGTERM))
+        self.write_config(hosts=["a.test"])
+        self.served = {"a.test:443": make_cert()}
+
+    def download_cacert(self):
+        self.downloads += 1
+        self.cacert.parent.mkdir(parents=True, exist_ok=True)
+        self.cacert.write_text("cacert")
+
+    def watch(self, rounds, minutes=5):
+        """Run the loop for `rounds` rounds; returns what it slept between them"""
+        naps = [None] * (rounds - 1) + [SystemExit(0)]
+        with mock.patch.object(time, "sleep", side_effect=naps) as sleep, self.assertRaises(SystemExit) as stopped:
+            crypto.pins_watch(minutes, timeout=1, max_depth=4)
+        self.assertEqual(stopped.exception.code, 0)
+        return [call.args[0] for call in sleep.call_args_list]
+
+    def test_collects_every_round_and_sleeps_in_between(self):
+        with mock.patch.object(crypto, "collect_round", wraps=crypto.collect_round) as collect_round:
+            self.assertEqual(self.watch(rounds=3, minutes=5), [300, 300, 300])
+        self.assertEqual(collect_round.call_count, 3)
+        self.assertEqual(len(self.stored_pins("a.test:443")), 1)
+
+    def test_cacert_is_downloaded_when_missing_then_left_alone(self):
+        self.watch(rounds=3)
+        self.assertEqual(self.downloads, 1)
+
+    def test_cacert_older_than_a_day_is_downloaded_again(self):
+        self.download_cacert()
+        two_days_ago = time.time() - 2 * 24 * 3600
+        os.utime(self.cacert, (two_days_ago, two_days_ago))
+        self.watch(rounds=2)
+        self.assertEqual(self.downloads, 2)
+
+    def test_recent_cacert_is_not_downloaded(self):
+        self.download_cacert()
+        an_hour_ago = time.time() - 3600
+        os.utime(self.cacert, (an_hour_ago, an_hour_ago))
+        self.watch(rounds=2)
+        self.assertEqual(self.downloads, 1)
+
+    def test_failed_cacert_download_does_not_stop_the_round(self):
+        with mock.patch.object(crypto, "get_ca_cert_pem", side_effect=CryptoCliException("Unable to reach")) as get:
+            self.watch(rounds=2)
+        self.assertEqual(get.call_count, 2)  # tried again at the next round
+        self.assertEqual(len(self.stored_pins("a.test:443")), 1)
+
+    def test_failed_round_does_not_stop_the_loop(self):
+        self.config_path.unlink()  # every round fails: no config
+        self.assertEqual(len(self.watch(rounds=3)), 3)
+        self.assertFalse(self.pins_path.exists())
+
+    def test_failing_host_does_not_stop_the_loop(self):
+        self.served = {"a.test:443": CryptoCliException("Connection refused")}
+        self.assertEqual(len(self.watch(rounds=2)), 2)
+        self.assertEqual(self.stored()["hosts"]["a.test:443"], {"checked_at": None, "pins": []})
+
+    def test_sigterm_handler_exits_with_code_zero(self):
+        self.watch(rounds=1)
+        with self.assertRaises(SystemExit) as stopped:
+            signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+        self.assertEqual(stopped.exception.code, 0)
+
+
+class TestPinsWatchProcess(unittest.TestCase):
+    """The real thing, as a container runs it: `pins-collect --watch` as a process, stopped by SIGTERM. Offline: the
+    one host never resolves (.invalid, RFC 2606) and a recent cacert.pem is already there, so nothing is downloaded."""
+
+    def test_writes_the_pins_then_stops_on_sigterm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config" / "crypto").mkdir(parents=True)
+            (root / "config" / "crypto" / "config.toml").write_text('hosts = ["nonexistent.invalid"]\n')
+            (root / "data" / "c4ffein-crypto-cli").mkdir(parents=True)
+            (root / "data" / "c4ffein-crypto-cli" / "cacert.pem").write_text("recent enough\n")
+            dirs = {f"XDG_{name}_HOME": str(root / name.lower()) for name in ("CONFIG", "DATA", "STATE")}
+            command = [sys.executable, str(GET_TLS_PIN.with_name("crypto.py")), "pins-collect", "--watch", "5"]
+            process = subprocess.Popen(
+                command, env={**os.environ, **dirs}, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            try:
+                pins = root / "state" / "crypto" / "pins.json"
+                deadline = time.monotonic() + 30
+                while not pins.exists() and process.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.1)
+                self.assertTrue(pins.exists(), "no pins file after the first round")
+                self.assertIsNone(process.poll(), "the loop ended by itself")
+                process.send_signal(signal.SIGTERM)
+                stdout, stderr = process.communicate(timeout=10)
+            finally:
+                process.kill()
+                process.wait()
+            self.assertEqual(process.returncode, 0, stderr.decode())
+            self.assertEqual(
+                json.loads(pins.read_text())["hosts"], {"nonexistent.invalid:443": {"checked_at": None, "pins": []}}
+            )
+            self.assertIn(b"0 verified (0 new), 1 failed", stdout)  # reached the pipe at once: line-buffered
 
 
 class TestParsePins(unittest.TestCase):

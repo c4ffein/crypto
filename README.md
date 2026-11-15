@@ -21,6 +21,7 @@ crypto - crypto tools
 - crypto host-check hostname[:port] --fingerprint   ── on success, print only the SHA256 fingerprint (hex)
 - crypto get-cacert                                 ── get cacert.pem from curl.se, used to select a root CA
 - crypto pins-collect                               ── server: verify config.toml's hosts into pins.json
+- crypto pins-collect --watch N                     ── every N minutes (default: 5), cacert.pem every day
 - crypto pins-update                                ── client: fetch them (remote_command), check, store
 - crypto pins-update --max-age N                    ── refuse pins older than N hours (default: 48)
 - crypto pins-update --no-local-check               ── store them without checking the hosts from here
@@ -67,7 +68,9 @@ tools:   get_tls_pin.py host    prints the stored fingerprints of a host, one pe
 ```
 
 - **`pins-collect`** keeps a set of pins per host (the old and the new certificate overlap during a rotation),
-  each until its certificate expires. A host that fails keeps its pins; the exit code is 1.
+  each until its certificate expires. A host that fails keeps its pins; the exit code is 1. With `--watch N` it
+  never ends: a round every N minutes (5 by default), `cacert.pem` downloaded again every day, one line per round
+  plus what changed or failed, and SIGTERM stops it at once. One writer at a time: a second one is refused.
 - **`pins-update`** trusts the transport to authenticate the answer (ssh and its `known_hosts`), and nothing else:
   the output is size-limited and strictly validated. It refuses pins that are stale (`--max-age`, 48 hours by
   default: the collector stopped) or older than the stored ones. For each host it then verifies what this
@@ -80,7 +83,8 @@ tools:   get_tls_pin.py host    prints the stored fingerprints of a host, one pe
 
 ### Server, as a [containerctl](https://github.com/c4ffein/containerctl) service
 
-`deploy/` holds the files; nothing listens, the container waits for scripts.
+`deploy/` holds the files. Nothing listens: the container runs `pins-collect --watch 5`, and is unhealthy (an
+issue in containerctl) when the pins have not been written for 20 minutes.
 
 ```bash
 mkdir -p ~/.config/crypto ~/.config/containerctl/images/crypto
@@ -89,7 +93,7 @@ cp deploy/containerctl/images/crypto.* ~/.config/containerctl/images/
 cp crypto.py ~/.config/containerctl/images/crypto/                      # the build context
 cp deploy/containerctl/services/crypto.toml ~/.config/containerctl/services/
 containerctl image build crypto && containerctl service up crypto
-containerctl service script crypto collect   # get-cacert + pins-collect: to be run on a schedule
+containerctl logs cctl-svc-crypto            # one line per round
 containerctl service script crypto pins      # what a client reads
 ```
 

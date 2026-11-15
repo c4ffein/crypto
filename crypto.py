@@ -20,12 +20,15 @@ Features:
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tomllib
 from collections.abc import Callable
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from hashlib import sha256 as sha256_hasher
@@ -621,6 +624,8 @@ PINS_MAX_HOSTS = 256
 PINS_MAX_PER_HOST = 16
 PINS_MAX_AGE_HOURS = 48
 PINS_CLOCK_SKEW = timedelta(minutes=10)
+WATCH_MINUTES = 5  # pins-collect --watch: between two rounds
+CACERT_MAX_AGE = timedelta(days=1)  # pins-collect --watch: cacert.pem is downloaded again past that
 REMOTE_COMMAND_TIMEOUT = 60
 TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 HOST_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789.-")
@@ -768,23 +773,45 @@ def newest_pins(pins: list[dict]) -> list[dict]:
     return sorted(pins, key=lambda pin: pin["last_seen"])[-PINS_MAX_PER_HOST:]
 
 
-def pins_collect(timeout: int, max_depth: int) -> int:
-    """Server side: verify every host of the config and merge what it serves into our pins file. A host that fails
-    keeps the pins it had (and its old `checked_at`, which is how a reader knows): the exit code says it failed."""
+@contextmanager
+def pins_lock():
+    """One writer of PINS_PATH at a time (a watching collector and a one-shot one, two updates): each reads the file,
+    then writes it back. The second one is refused, it does not wait. flock: a killed process holds nothing."""
+    import fcntl  # Unix only, as the pins commands are
+
+    lock_path = PINS_PATH.with_name("pins.lock")
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock = lock_path.open("w")
+    except OSError as exc:
+        raise CryptoCliException(f"Unable to create {lock_path}") from exc
+    with lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise CryptoCliException("Another crypto is writing the pins: try again when it is done") from exc
+        yield
+
+
+@pins_lock()
+def collect_round(timeout: int, max_depth: int, quiet: bool = False) -> dict[str, int]:
+    """Verify every host of the config and merge what it serves into our pins file. A host that fails keeps the pins
+    it had (and its old `checked_at`, which is how a reader knows). `quiet` leaves out the hosts with nothing new.
+    Returns how many hosts were verified, how many of those served a certificate not seen before, how many failed."""
     keys = list(dict.fromkeys(host_key(target) for target in load_config_list("hosts")))
     if len(keys) > PINS_MAX_HOSTS:
         raise CryptoCliException(f"More than {PINS_MAX_HOSTS} hosts in {CONFIG_PATH}")
     previous = (load_pins() or {"hosts": {}})["hosts"]
     now = datetime.now(UTC)
     document = {"version": PINS_VERSION, "generated_at": format_time(now), "hosts": {}}
-    failures = 0
+    counts = {"verified": 0, "new": 0, "failed": 0}
     for key in keys:
         entry = previous.get(key, {"checked_at": None, "pins": []})
         pins, checked_at = live_pins(entry["pins"], now), entry["checked_at"]
         try:
             pin = new_pin(verify_host(key, timeout, max_depth), now, "collected")
         except CryptoCliException as exc:
-            failures += 1
+            counts["failed"] += 1
             print(f"{key:<44} FAILED     {exc}", file=sys.stderr)
         else:
             known = next((known for known in pins if known["sha256"] == pin["sha256"]), None)
@@ -793,10 +820,59 @@ def pins_collect(timeout: int, max_depth: int) -> int:
             else:
                 known["last_seen"], known["source"] = pin["last_seen"], "collected"
             checked_at = format_time(now)
-            print(f"{key:<44} {'new' if known is None else 'seen':<10} {pin['sha256']}")
+            counts["verified"] += 1
+            counts["new"] += known is None
+            if known is None or not quiet:
+                print(f"{key:<44} {'new' if known is None else 'seen':<10} {pin['sha256']}")
         document["hosts"][key] = {"checked_at": checked_at, "pins": newest_pins(pins)}
     store_pins(document)
-    return 1 if failures else 0
+    return counts
+
+
+def pins_collect(timeout: int, max_depth: int) -> int:
+    """Server side, once: exit code 1 when a host failed"""
+    return 1 if collect_round(timeout, max_depth)["failed"] else 0
+
+
+def refresh_cacert() -> None:
+    """Download cacert.pem when there is none or when it is older than CACERT_MAX_AGE. Its age is its mtime: a
+    restart does not reset it."""
+    try:
+        age = time.time() - (SHARE_PATH / "cacert.pem").stat().st_mtime
+    except OSError:
+        age = None
+    if age is None or age > CACERT_MAX_AGE.total_seconds():
+        get_ca_cert_pem()
+        print(f"{format_time(datetime.now(UTC))} cacert.pem downloaded")
+
+
+def pins_watch(minutes: int, timeout: int, max_depth: int) -> int:
+    """Server side, as the whole job of a container: a round of pins-collect every `minutes`, cacert.pem kept fresh.
+    One line per round, plus what changed (a new pin) or went wrong (a host that fails). A round that fails is said
+    and the next one still comes. SIGTERM (docker stop) ends it at once, exit code 0: every write is atomic, there
+    is nothing to finish."""
+
+    def stop(signum, frame):
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, stop)  # the PID 1 of a container ignores a SIGTERM it does not handle
+    sys.stdout.reconfigure(line_buffering=True)  # a pipe (docker logs) would hold the lines back otherwise
+    while True:
+        try:
+            refresh_cacert()
+        except CryptoCliException as exc:
+            print(
+                f"{format_time(datetime.now(UTC))} cacert.pem not refreshed, keeping the old one: {exc}",
+                file=sys.stderr,
+            )
+        try:
+            counts = collect_round(timeout, max_depth, quiet=True)
+        except CryptoCliException as exc:
+            print(f"{format_time(datetime.now(UTC))} round failed: {exc}", file=sys.stderr)
+        else:
+            summary = f"{counts['verified']} verified ({counts['new']} new), {counts['failed']} failed"
+            print(f"{format_time(datetime.now(UTC))} {summary}")
+        time.sleep(minutes * 60)
 
 
 def run_remote_command(command: list[str]) -> bytes:
@@ -861,6 +937,7 @@ def cross_check(key: str, pins: list[dict], now: datetime, timeout: int, max_dep
     return "approved"
 
 
+@pins_lock()
 def pins_update(max_age_hours: int, local_check: bool, timeout: int, max_depth: int) -> int:
     """Client side: fetch the pins a remote collected, refuse them when stale or older than ours, compare them with
     what this machine is served, and store the result. Exit code 1 when a host disagrees and was not approved."""
@@ -936,6 +1013,14 @@ def parse_args():
 
     # pins subcommands
     pins_collect_parser = subparsers.add_parser("pins-collect", help="Verify the configured hosts, keep their pins")
+    pins_collect_parser.add_argument(
+        "--watch",
+        type=int,
+        nargs="?",
+        const=WATCH_MINUTES,
+        metavar="N",
+        help=f"Collect again every N minutes (default: {WATCH_MINUTES}), cacert.pem refreshed every day",
+    )
     pins_update_parser = subparsers.add_parser("pins-update", help="Fetch pins through remote_command, check, store")
     pins_update_parser.add_argument(
         "--max-age",
@@ -972,6 +1057,7 @@ crypto - crypto tools
 {D}- {D}crypto host-check hostname[:port] {W}--fingerprint   {D}── on success, print only the SHA256 fingerprint (hex)
 {D}- {W}crypto get-cacert                                 {D}── get cacert.pem from curl.se, used to select a root CA
 {D}- {W}crypto pins-collect                               {D}── server: verify config.toml's hosts into pins.json
+{D}- {D}crypto pins-collect {W}--watch N                     {D}── every N minutes (default: 5), cacert.pem every day
 {D}- {W}crypto pins-update                                {D}── client: fetch them (remote_command), check, store
 {D}- {D}crypto pins-update {W}--max-age N                    {D}── refuse pins older than N hours (default: 48)
 {D}- {D}crypto pins-update {W}--no-local-check               {D}── store them without checking the hosts from here{W}
@@ -1025,6 +1111,10 @@ def main():
         get_ca_cert_pem()
         print(f"{Color.GREEN.value}✓ cacert.pem downloaded to {SHARE_PATH / 'cacert.pem'}")
         return 0
+    if args.command == "pins-collect" and args.watch is not None:
+        if args.watch < 1:
+            raise CryptoCliException("--watch takes a number of minutes, at least 1")
+        return pins_watch(args.watch, args.timeout, args.max_depth)
     if args.command == "pins-collect":
         return pins_collect(args.timeout, args.max_depth)
     if args.command == "pins-update":
