@@ -279,6 +279,13 @@ class TestCacertParsing(ChainTestCase):
         corrupted = "Name\n====\n-----BEGIN CERTIFICATE-----\nnot base64 at all\n-----END CERTIFICATE-----\n"
         self.assert_unparseable(corrupted)
 
+    def test_root_that_cannot_be_loaded_is_skipped(self):
+        """One root the library refuses must not cost all the others"""
+        write_bundle(self.bundle, {"Test Root": self.root})
+        with self.bundle.open("a", encoding="utf-8") as file:
+            file.write("\nBroken Root\n===========\n-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n")
+        self.assertEqual(crypto.load_cacerts(str(self.bundle)), {"Test Root": self.root})
+
     def test_missing_file(self):
         with self.assertRaisesRegex(CryptoCliException, "not found"):
             crypto.load_cacerts(str(Path(self.tmp.name) / "absent.pem"))

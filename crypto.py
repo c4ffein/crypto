@@ -13,14 +13,20 @@ Features:
 - Issuer checks (basicConstraints CA flag, path length, keyUsage keyCertSign)
 - Automatic chain traversal via AIA extensions
 - Root CA verification against Mozilla's trusted root bundle
+- Pins: collect the verified leaf fingerprints of a list of hosts (on a server), fetch them from
+  there through a configured command (ssh), cross-check them from here, keep them for other tools
 """
 
 import argparse
+import json
 import os
+import subprocess
 import sys
 import tempfile
+import threading
+import tomllib
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from hashlib import sha256 as sha256_hasher
 from http.client import HTTPException
@@ -40,11 +46,21 @@ from cryptography.x509 import load_pem_x509_certificate
 from cryptography.x509.extensions import Extension as X509Extension
 from cryptography.x509.oid import AuthorityInformationAccessOID, ExtensionOID, NameOID, ObjectIdentifier
 
-SHARE_PATH = Path.home() / ".local" / "share" / "c4ffein-crypto-cli"
+
+def xdg_dir(variable: str, default: str) -> Path:
+    """An XDG base directory: the variable when it holds an absolute path (the spec ignores the rest), else ~/default"""
+    value = os.environ.get(variable, "")
+    return Path(value) if value.startswith("/") else Path.home() / default
+
+
+SHARE_PATH = xdg_dir("XDG_DATA_HOME", ".local/share") / "c4ffein-crypto-cli"  # cacert.pem: downloaded, replaceable
+CONFIG_PATH = xdg_dir("XDG_CONFIG_HOME", ".config") / "crypto" / "config.toml"  # read-only: never written by us
+PINS_PATH = xdg_dir("XDG_STATE_HOME", ".local/state") / "crypto" / "pins.json"  # ours: we are its only writer
 
 MAX_DEPTH = 4
 TIMEOUT = 4
 VERBOSE = False  # Global verbose flag
+QUIET = False  # Set by the pins commands: one line per host instead of the per-step status of each verification
 FINGERPRINT = False  # When set, stdout is reserved for the machine-readable fingerprint; status goes to stderr
 
 colors = {"RED": "31", "GREEN": "32", "PURP": "34", "DIM": "90", "WHITE": "39"}
@@ -69,7 +85,9 @@ def vprint(*args, **kwargs):
 
 def status_print(*args, **kwargs):
     """Print user-facing status. Routed to stderr in --fingerprint mode so stdout stays machine-readable."""
-    if FINGERPRINT:
+    if QUIET and not VERBOSE:
+        return
+    if FINGERPRINT or QUIET:
         kwargs.setdefault("file", sys.stderr)
     print(*args, **kwargs)
 
@@ -123,25 +141,24 @@ def get_bytes_from_url(
     return data
 
 
-def write_to_file(obj: Any, filename: str) -> None:
-    filepath = SHARE_PATH / filename
+def atomic_write(filepath: Path, data: bytes, mode: int = 0o644) -> None:
+    """Write through a temp file in the same directory, then rename over the destination: a reader sees the old
+    file or the new one, never a partial one."""
     try:
-        SHARE_PATH.mkdir(parents=True, exist_ok=True)
-        data = obj if isinstance(obj, bytes) else str(obj).encode()
-        # Atomic write: temp file in the same directory, then rename over the destination
-        temp_fd, temp_name = tempfile.mkstemp(dir=SHARE_PATH, prefix=f".{filename}.")
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        temp_fd, temp_name = tempfile.mkstemp(dir=filepath.parent, prefix=f".{filepath.name}.")
         temp_path = Path(temp_name)
         try:
-            try:
-                os.write(temp_fd, data)
-            finally:
-                os.close(temp_fd)
-            temp_path.chmod(0o644)  # mkstemp creates 0o600; the CA bundle is public
+            with os.fdopen(temp_fd, "wb") as file:
+                file.write(data)
+                file.flush()
+                os.fsync(file.fileno())
+            temp_path.chmod(mode)  # mkstemp creates 0o600
             temp_path.replace(filepath)
         except BaseException:
             temp_path.unlink(missing_ok=True)
             raise
-    except (OSError, TypeError) as exc:
+    except OSError as exc:
         raise CryptoCliException(f"Failed to write to file {filepath}") from exc
 
 
@@ -203,8 +220,8 @@ def get_certificate_from_url(url: str) -> X509Certificate:
 
 
 def get_ca_cert_pem() -> None:
-    """Download Mozilla's CA certificate bundle to ~/.local/share/c4ffein-crypto-cli/cacert.pem"""
-    write_to_file(get_bytes_from_url("https://curl.se/ca/cacert.pem"), "cacert.pem")
+    """Download Mozilla's CA certificate bundle to SHARE_PATH (~/.local/share/c4ffein-crypto-cli/cacert.pem)"""
+    atomic_write(SHARE_PATH / "cacert.pem", get_bytes_from_url("https://curl.se/ca/cacert.pem"))  # public: 0o644
 
 
 def get_hostname_and_port(host):
@@ -417,11 +434,18 @@ def load_cacerts(filename: str) -> dict[str, X509Certificate]:
         if underline < 1 or not lines[underline].startswith("====="):
             raise CryptoCliException(parse_error)
         certs[lines[underline - 1]] = "\n".join(lines[begin : end + 1]) + "\n"
-    vprint(f"{len(certs)} root CAs loaded from cacert.pem")
-    try:
-        return {name: load_pem_x509_certificate(cert.encode()) for name, cert in certs.items()}
-    except ValueError as exc:
-        raise CryptoCliException(parse_error) from exc
+    roots = {}
+    for name, cert in certs.items():
+        try:
+            roots[name] = load_pem_x509_certificate(cert.encode())
+        except ValueError:
+            # One root the library refuses (it gets stricter with releases) must not cost us all the others:
+            # without it, the chains that end there fail, which is the safe side
+            vprint(f"{Color.DIM.value}Skipping a root CA that could not be loaded: {printable(name)}")
+    if not roots:
+        raise CryptoCliException(parse_error)
+    vprint(f"{len(roots)} root CAs loaded from cacert.pem")
+    return roots
 
 
 class CertStore:
@@ -573,6 +597,307 @@ class CertStore:
         raise CryptoCliException("Broken chain")
 
 
+def verify_host(target: str, timeout: int = TIMEOUT, max_depth: int = MAX_DEPTH) -> X509Certificate:
+    """Fully verify what `target` (hostname[:port]) serves and return its leaf certificate; raises otherwise."""
+    hostname, port = get_hostname_and_port(target)
+    certificate = get_certificate_from_hostname_and_port(hostname, port, timeout=timeout)
+    CertStore(SHARE_PATH / "cacert.pem", max_depth, hostname=hostname).start_chain_traversal(certificate)
+    return certificate
+
+
+# ── Pins ──────────────────────────────────────────────────────────────────────────────────────────────────────────
+# A pin is the SHA-256 of a leaf certificate (DER): what the other tools check on top of CA + hostname verification.
+# `pins-collect` (on a server) verifies a list of hosts and keeps what they serve in PINS_PATH. `pins-update` (here)
+# reads that file through a configured command (ssh: the transport is what authenticates it), compares it with what
+# this machine is served, and keeps the result in its own PINS_PATH. Same format on both sides:
+#   {"version": 1, "generated_at": T, "hosts": {"host:port": {"checked_at": T | null, "pins": [
+#       {"sha256": 64 hex, "not_after": T, "first_seen": T, "last_seen": T, "source": "collected" | "approved"}]}}}
+# T is UTC, TIME_FORMAT. A host has a *set* of pins: the old and the new certificate overlap during a rotation.
+# A pin lives until its certificate expires. "approved" is a certificate seen here only, that the user accepted.
+
+PINS_VERSION = 1
+PINS_MAX_BYTES = 1024 * 1024
+PINS_MAX_HOSTS = 256
+PINS_MAX_PER_HOST = 16
+PINS_MAX_AGE_HOURS = 48
+PINS_CLOCK_SKEW = timedelta(minutes=10)
+REMOTE_COMMAND_TIMEOUT = 60
+TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+HOST_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789.-")
+DIGITS = frozenset("0123456789")
+HEX_CHARS = frozenset("0123456789abcdef")
+
+
+def is_valid_host_key(value: object) -> bool:
+    """`hostname:port`, lowercase: 1 to 253 allowlisted characters not starting or ending with . or -, 1 to 5 digits"""
+    if not isinstance(value, str):
+        return False
+    hostname, colon, port = value.rpartition(":")
+    return (
+        bool(colon)
+        and 1 <= len(hostname) <= 253
+        and set(hostname) <= HOST_CHARS
+        and hostname[0] not in ".-"
+        and hostname[-1] not in ".-"
+        and 1 <= len(port) <= 5
+        and set(port) <= DIGITS
+    )
+
+
+def is_valid_sha256(value: object) -> bool:
+    """64 lowercase hex characters"""
+    return isinstance(value, str) and len(value) == 64 and set(value) <= HEX_CHARS
+
+
+def format_time(moment: datetime) -> str:
+    return moment.astimezone(UTC).strftime(TIME_FORMAT)
+
+
+def parse_time(value: Any) -> datetime:
+    """The one format we write, or ValueError"""
+    if not isinstance(value, str):
+        raise ValueError("invalid timestamp")
+    return datetime.strptime(value, TIME_FORMAT).replace(tzinfo=UTC)
+
+
+def printable(text: str, limit: int = 200) -> str:
+    """Text we did not write, made safe to show on a terminal: no control characters, and not all of it"""
+    return "".join(c if c.isprintable() else " " for c in text)[:limit].strip()
+
+
+def host_key(target: str) -> str:
+    """hostname[:port] as the key of a pins file: lowercase, port always there, allowlisted characters only"""
+    hostname, port = get_hostname_and_port(target)
+    key = f"{hostname.lower()}:{port}"
+    if not is_valid_host_key(key):
+        raise CryptoCliException(f"Invalid host: {printable(target)}")
+    return key
+
+
+def load_config_list(name: str) -> list[str]:
+    """A list of strings of the config file. The config is read-only: nothing here ever writes it."""
+    try:
+        with CONFIG_PATH.open("rb") as file:
+            value = tomllib.load(file).get(name)
+    except FileNotFoundError as exc:
+        raise CryptoCliException(f"Config not found: {CONFIG_PATH}") from exc
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise CryptoCliException(f"Config could not be read: {CONFIG_PATH}: {exc}") from exc
+    if not isinstance(value, list) or not value or not all(isinstance(item, str) and item for item in value):
+        raise CryptoCliException(f"Missing or invalid '{name}' (a list of strings) in {CONFIG_PATH}")
+    return value
+
+
+def clean_time(value: Any, optional: bool = False) -> str | None:
+    return None if optional and value is None else format_time(parse_time(value))
+
+
+def clean_pin(pin: Any, key: str, trust_source: bool) -> dict:
+    sha256 = pin.get("sha256") if isinstance(pin, dict) else None
+    if not is_valid_sha256(sha256):
+        raise ValueError(f"invalid pin for {key}")
+    source = pin.get("source") if trust_source else "collected"
+    if source not in ("collected", "approved"):
+        raise ValueError(f"invalid pin source for {key}")
+    times = {name: clean_time(pin.get(name)) for name in ("not_after", "first_seen", "last_seen")}
+    return {"sha256": sha256, **times, "source": source}
+
+
+def clean_host(key: str, entry: Any, trust_source: bool) -> dict:
+    if not is_valid_host_key(key):
+        raise ValueError("invalid host name")
+    pins = entry.get("pins") if isinstance(entry, dict) else None
+    if not isinstance(pins, list) or len(pins) > PINS_MAX_PER_HOST:
+        raise ValueError(f"invalid 'pins' for {key}")
+    checked_at = clean_time(entry.get("checked_at"), optional=True)
+    return {"checked_at": checked_at, "pins": [clean_pin(pin, key, trust_source) for pin in pins]}
+
+
+def parse_pins(raw: bytes, origin: str, trust_source: bool) -> dict:
+    """Parse a pins document, strictly: what is not exactly what we write is refused, and what comes back is rebuilt
+    from the validated fields alone (clean_*: they raise ValueError). `trust_source` is for our own file: a remote
+    never gets to say that a pin was approved here."""
+    try:
+        if len(raw) > PINS_MAX_BYTES:
+            raise ValueError(f"more than {PINS_MAX_BYTES} bytes")
+        document = json.loads(raw)
+        if not isinstance(document, dict) or document.get("version") != PINS_VERSION:
+            raise ValueError(f"not a version {PINS_VERSION} pins document")
+        hosts = document.get("hosts")
+        if not isinstance(hosts, dict) or len(hosts) > PINS_MAX_HOSTS:
+            raise ValueError("invalid 'hosts'")
+        generated_at = clean_time(document.get("generated_at"))
+        clean_hosts = {key: clean_host(key, entry, trust_source) for key, entry in hosts.items()}
+    except (ValueError, RecursionError) as exc:
+        raise CryptoCliException(f"Invalid pins from {origin}: {exc}") from exc
+    return {"version": PINS_VERSION, "generated_at": generated_at, "hosts": clean_hosts}
+
+
+def load_pins() -> dict | None:
+    """Our own pins file, None when there is none yet"""
+    try:
+        raw = PINS_PATH.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise CryptoCliException(f"Unable to read {PINS_PATH}") from exc
+    return parse_pins(raw, str(PINS_PATH), trust_source=True)
+
+
+def store_pins(document: dict) -> None:
+    atomic_write(PINS_PATH, (json.dumps(document, indent=2, sort_keys=True) + "\n").encode(), mode=0o600)
+
+
+def new_pin(certificate: X509Certificate, now: datetime, source: str) -> dict:
+    return {
+        "sha256": certificate.fingerprint(hashes.SHA256()).hex(),
+        "not_after": format_time(certificate.not_valid_after_utc),
+        "first_seen": format_time(now),
+        "last_seen": format_time(now),
+        "source": source,
+    }
+
+
+def live_pins(pins: list[dict], now: datetime) -> list[dict]:
+    """Without the pins of expired certificates: nothing valid can match them anymore"""
+    return [pin for pin in pins if parse_time(pin["not_after"]) > now]
+
+
+def newest_pins(pins: list[dict]) -> list[dict]:
+    """At most what a pins file may hold for a host, the most recently seen ones (timestamps sort as text)"""
+    return sorted(pins, key=lambda pin: pin["last_seen"])[-PINS_MAX_PER_HOST:]
+
+
+def pins_collect(timeout: int, max_depth: int) -> int:
+    """Server side: verify every host of the config and merge what it serves into our pins file. A host that fails
+    keeps the pins it had (and its old `checked_at`, which is how a reader knows): the exit code says it failed."""
+    keys = list(dict.fromkeys(host_key(target) for target in load_config_list("hosts")))
+    if len(keys) > PINS_MAX_HOSTS:
+        raise CryptoCliException(f"More than {PINS_MAX_HOSTS} hosts in {CONFIG_PATH}")
+    previous = (load_pins() or {"hosts": {}})["hosts"]
+    now = datetime.now(UTC)
+    document = {"version": PINS_VERSION, "generated_at": format_time(now), "hosts": {}}
+    failures = 0
+    for key in keys:
+        entry = previous.get(key, {"checked_at": None, "pins": []})
+        pins, checked_at = live_pins(entry["pins"], now), entry["checked_at"]
+        try:
+            pin = new_pin(verify_host(key, timeout, max_depth), now, "collected")
+        except CryptoCliException as exc:
+            failures += 1
+            print(f"{key:<44} FAILED     {exc}", file=sys.stderr)
+        else:
+            known = next((known for known in pins if known["sha256"] == pin["sha256"]), None)
+            if known is None:
+                pins.append(pin)
+            else:
+                known["last_seen"], known["source"] = pin["last_seen"], "collected"
+            checked_at = format_time(now)
+            print(f"{key:<44} {'new' if known is None else 'seen':<10} {pin['sha256']}")
+        document["hosts"][key] = {"checked_at": checked_at, "pins": newest_pins(pins)}
+    store_pins(document)
+    return 1 if failures else 0
+
+
+def run_remote_command(command: list[str]) -> bytes:
+    """Run the configured command (an argv, never a shell) and hand back its stdout, read up to the size limit only.
+    Its stderr is left on ours: ssh's own messages are the user's to read."""
+    try:
+        with subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE) as process:
+            timer = threading.Timer(REMOTE_COMMAND_TIMEOUT, process.kill)
+            timer.start()
+            try:
+                output = process.stdout.read(PINS_MAX_BYTES + 1)
+                if len(output) > PINS_MAX_BYTES:
+                    process.kill()
+                returncode = process.wait()
+            finally:
+                timer.cancel()
+    except OSError as exc:
+        raise CryptoCliException(f"Unable to run remote_command: {exc}") from exc
+    if len(output) > PINS_MAX_BYTES:
+        raise CryptoCliException(f"remote_command sent more than {PINS_MAX_BYTES} bytes")
+    if returncode < 0:
+        raise CryptoCliException(f"remote_command was killed (it has {REMOTE_COMMAND_TIMEOUT}s to answer)")
+    if returncode != 0:
+        raise CryptoCliException(f"remote_command failed (exit code {returncode})")
+    return output
+
+
+def confirm(question: str) -> bool:
+    """Ask on the terminal. No terminal (cron, a pipe) is a no."""
+    if not sys.stdin.isatty():
+        return False
+    try:
+        return input(f"{question} [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def cross_check(key: str, pins: list[dict], now: datetime, timeout: int, max_depth: int) -> str:
+    """Compare the pins of a host with what this machine is served. Agreeing is the point of a second vantage
+    point; disagreeing is a rotation the remote has not collected yet, or an interception on this network: the
+    user decides, and `pins` gains the certificate seen here only when they approve it."""
+    try:
+        certificate = verify_host(key, timeout, max_depth)
+    except CryptoCliException as exc:
+        print(f"{Color.DIM.value}{key}: not checked from here: {exc}{Color.WHITE.value}", file=sys.stderr)
+        return "unchecked"
+    seen = new_pin(certificate, now, "approved")
+    for pin in pins:
+        if pin["sha256"] == seen["sha256"]:
+            pin["last_seen"] = max(pin["last_seen"], seen["last_seen"])
+            return "agree" if pin["source"] == "collected" else "approved"
+    R, W = Color.RED.value, Color.WHITE.value
+    print(f"{R}\n  !!  {key}: this machine is served a certificate the remote has not seen  !!{W}", file=sys.stderr)
+    issuer = printable(certificate.issuer.rfc4514_string())
+    print(f"  here    {seen['sha256']}  expires {seen['not_after']}, issued by {issuer}", file=sys.stderr)
+    for pin in pins:
+        print(f"  remote  {pin['sha256']}  expires {pin['not_after']}, last seen {pin['last_seen']}", file=sys.stderr)
+    print("  A rotation the remote has not collected yet, or an interception on this network.", file=sys.stderr)
+    if not confirm("  Trust the certificate seen here as well?"):
+        return "DISAGREE"
+    pins.append(seen)
+    return "approved"
+
+
+def pins_update(max_age_hours: int, local_check: bool, timeout: int, max_depth: int) -> int:
+    """Client side: fetch the pins a remote collected, refuse them when stale or older than ours, compare them with
+    what this machine is served, and store the result. Exit code 1 when a host disagrees and was not approved."""
+    remote = parse_pins(run_remote_command(load_config_list("remote_command")), "remote_command", trust_source=False)
+    now, max_age = datetime.now(UTC), timedelta(hours=max_age_hours)
+    generated_at = parse_time(remote["generated_at"])
+    if generated_at > now + PINS_CLOCK_SKEW:
+        raise CryptoCliException(f"Remote pins are from the future ({remote['generated_at']}): check the clocks")
+    if now - generated_at > max_age:
+        raise CryptoCliException(
+            f"Remote pins are stale: generated {remote['generated_at']}, more than {max_age_hours}h ago "
+            "(is pins-collect still running on the remote?)"
+        )
+    local = load_pins() or {"generated_at": remote["generated_at"], "hosts": {}}
+    if generated_at < parse_time(local["generated_at"]):
+        raise CryptoCliException(
+            f"Remote pins ({remote['generated_at']}) are older than the ones stored ({local['generated_at']})"
+        )
+    document = {"version": PINS_VERSION, "generated_at": remote["generated_at"], "hosts": {}}
+    disagreements = 0
+    for key, entry in remote["hosts"].items():
+        pins = live_pins(entry["pins"], now)
+        collected = {pin["sha256"] for pin in pins}
+        mine = live_pins(local["hosts"].get(key, {"pins": []})["pins"], now)
+        # What the user approved here outlives an update, until its certificate expires or the remote sees it too
+        pins += [pin for pin in mine if pin["source"] == "approved" and pin["sha256"] not in collected]
+        if entry["checked_at"] is None or now - parse_time(entry["checked_at"]) > max_age:
+            print(f"{Color.DIM.value}{key}: the remote last verified it: {entry['checked_at']}", file=sys.stderr)
+        status = cross_check(key, pins, now, timeout, max_depth) if local_check else "stored"
+        disagreements += status == "DISAGREE"
+        print(f"{key:<44} {status:<10} {len(pins)} pin(s)")
+        document["hosts"][key] = {"checked_at": entry["checked_at"], "pins": newest_pins(pins)}
+    store_pins(document)
+    print(f"{Color.GREEN.value}✓ pins stored in {PINS_PATH}{Color.WHITE.value}")
+    return 1 if disagreements else 0
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         prog="crypto",
@@ -609,6 +934,22 @@ def parse_args():
     # get-cacert subcommand
     subparsers.add_parser("get-cacert", help="Download cacert.pem from curl.se")
 
+    # pins subcommands
+    pins_collect_parser = subparsers.add_parser("pins-collect", help="Verify the configured hosts, keep their pins")
+    pins_update_parser = subparsers.add_parser("pins-update", help="Fetch pins through remote_command, check, store")
+    pins_update_parser.add_argument(
+        "--max-age",
+        type=int,
+        default=PINS_MAX_AGE_HOURS,
+        help=f"Refuse remote pins older than this many hours (default: {PINS_MAX_AGE_HOURS})",
+    )
+    pins_update_parser.add_argument(
+        "--no-local-check", action="store_true", help="Store the remote pins without checking the hosts from here"
+    )
+    for pins_parser in (pins_collect_parser, pins_update_parser):
+        pins_parser.add_argument("--timeout", type=int, default=TIMEOUT, help="Connection timeout in seconds")
+        pins_parser.add_argument("--max-depth", type=int, default=MAX_DEPTH, help="Maximum certificate chain depth")
+
     args = parser.parse_args()
 
     if args.help or not args.command:
@@ -629,53 +970,67 @@ crypto - crypto tools
 {D}- {D}crypto host-check hostname[:port] {W}--max-depth N   {D}── set max chain depth (default: 4)
 {D}- {D}crypto host-check hostname[:port] {W}--expect-fail   {D}── expect verification to fail (for testing)
 {D}- {D}crypto host-check hostname[:port] {W}--fingerprint   {D}── on success, print only the SHA256 fingerprint (hex)
-{D}- {W}crypto get-cacert                                 {D}── get cacert.pem from curl.se, used to select a root CA{W}
+{D}- {W}crypto get-cacert                                 {D}── get cacert.pem from curl.se, used to select a root CA
+{D}- {W}crypto pins-collect                               {D}── server: verify config.toml's hosts into pins.json
+{D}- {W}crypto pins-update                                {D}── client: fetch them (remote_command), check, store
+{D}- {D}crypto pins-update {W}--max-age N                    {D}── refuse pins older than N hours (default: 48)
+{D}- {D}crypto pins-update {W}--no-local-check               {D}── store them without checking the hosts from here{W}
 ─────────────────────
 Global options:
   -v, --verbose                                     {D}── enable detailed output{W}
   -h, --help                                        {D}── show this help message{W}
+─────────────────────
+Files (XDG_CONFIG_HOME, XDG_STATE_HOME, XDG_DATA_HOME are honoured):
+  ~/.config/crypto/config.toml                      {D}── hosts = [...] and / or remote_command = [...]{W}
+  ~/.local/state/crypto/pins.json                   {D}── the pins: get_tls_pin.py reads them for other tools{W}
+  ~/.local/share/c4ffein-crypto-cli/cacert.pem      {D}── the root CAs{W}
 """
     print(help_text)
 
 
+def host_check(args) -> int:
+    try:
+        certificate = verify_host(args.target, args.timeout, args.max_depth)
+        status_print(f"{Color.GREEN.value}✓ Certificate chain verification complete!")
+
+        if args.expect_fail:
+            print(f"{Color.RED.value}ERROR: Expected failure but verification succeeded", file=sys.stderr)
+            return 1
+        # Only emit the fingerprint once verification has fully succeeded, so a hash on stdout is trustworthy.
+        if args.fingerprint:
+            print(certificate.fingerprint(hashes.SHA256()).hex())
+        return 0
+    except CryptoCliNetworkException:
+        raise  # No verdict was reached: never counts as an expected verification failure
+    except CryptoCliException as e:
+        if args.expect_fail:
+            vprint(f"Verification failed as expected: {e}")
+            status_print(f"{Color.GREEN.value}✓ Failed as expected")
+            return 0
+        else:
+            raise  # Re-raise to be caught by main exception handler
+
+
 def main():
-    global VERBOSE, FINGERPRINT
+    global VERBOSE, FINGERPRINT, QUIET
     args = parse_args()
     if not args:
         return 0  # Help was shown, not an error
 
     VERBOSE = args.verbose
     FINGERPRINT = getattr(args, "fingerprint", False)
+    QUIET = args.command in ("pins-collect", "pins-update")
 
     if args.command == "get-cacert":
         get_ca_cert_pem()
         print(f"{Color.GREEN.value}✓ cacert.pem downloaded to {SHARE_PATH / 'cacert.pem'}")
         return 0
-
+    if args.command == "pins-collect":
+        return pins_collect(args.timeout, args.max_depth)
+    if args.command == "pins-update":
+        return pins_update(args.max_age, not args.no_local_check, args.timeout, args.max_depth)
     if args.command == "host-check":
-        try:
-            hostname, port = get_hostname_and_port(args.target)
-            certificate = get_certificate_from_hostname_and_port(hostname, port, timeout=args.timeout)
-            certificate_manager = CertStore(SHARE_PATH / "cacert.pem", args.max_depth, hostname=hostname)
-            certificate_manager.start_chain_traversal(certificate)
-            status_print(f"{Color.GREEN.value}✓ Certificate chain verification complete!")
-
-            if args.expect_fail:
-                print(f"{Color.RED.value}ERROR: Expected failure but verification succeeded", file=sys.stderr)
-                return 1
-            # Only emit the fingerprint once verification has fully succeeded, so a hash on stdout is trustworthy.
-            if args.fingerprint:
-                print(certificate.fingerprint(hashes.SHA256()).hex())
-            return 0
-        except CryptoCliNetworkException:
-            raise  # No verdict was reached: never counts as an expected verification failure
-        except CryptoCliException as e:
-            if args.expect_fail:
-                vprint(f"Verification failed as expected: {e}")
-                status_print(f"{Color.GREEN.value}✓ Failed as expected")
-                return 0
-            else:
-                raise  # Re-raise to be caught by main exception handler
+        return host_check(args)
 
     return 1  # Should never reach here, but return error if we do
 
