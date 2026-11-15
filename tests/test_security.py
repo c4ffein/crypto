@@ -816,6 +816,11 @@ class TestChainSignatureFailure(unittest.TestCase):
                 x509.AuthorityKeyIdentifier.from_issuer_public_key(cls.root_key.public_key()),
                 critical=False,
             )
+            .add_extension(
+                # Claims to be a CA, as an attacker would: the signature check is what must reject it
+                x509.BasicConstraints(ca=True, path_length=None),
+                critical=True,
+            )
             .sign(cls.attacker_key, hashes.SHA256())  # Signed by attacker, NOT root!
         )
 

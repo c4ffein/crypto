@@ -35,7 +35,7 @@ if __name__ == "__main__":
         print("=" * 70)
         print("Running unit tests...")
         print("=" * 70)
-        for pattern in ["test_security.py", "test_help.py", "test_exit_codes.py"]:
+        for pattern in ["test_security.py", "test_hardening.py", "test_help.py", "test_exit_codes.py"]:
             suite.addTests(loader.discover("tests", pattern=pattern))
     elif run_integration_only:
         # Discover integration tests only

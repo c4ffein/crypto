@@ -10,20 +10,26 @@ Features:
 - Full certificate chain verification with cryptographic signature validation
 - Hostname verification (SAN/CN with wildcard support per RFC 6125)
 - Certificate validity period checks
+- Issuer checks (basicConstraints CA flag, path length, keyUsage keyCertSign)
 - Automatic chain traversal via AIA extensions
 - Root CA verification against Mozilla's trusted root bundle
 """
 
 import argparse
+import os
 import sys
+import tempfile
+from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import Enum
 from hashlib import sha256 as sha256_hasher
+from http.client import HTTPException
 from pathlib import Path
-from socket import create_connection
+from socket import create_connection, gaierror
 from ssl import DER_cert_to_PEM_cert, SSLCertVerificationError, create_default_context
 from typing import Any
-from urllib.request import URLError, urlopen
+from urllib.parse import urlparse
+from urllib.request import HTTPRedirectHandler, build_opener
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
@@ -49,6 +55,10 @@ class CryptoCliException(Exception):
     pass
 
 
+class CryptoCliNetworkException(CryptoCliException):
+    """The host could not be reached at all: no verification verdict, so --expect-fail must not swallow it."""
+
+
 def vprint(*args, **kwargs):
     """Print only if verbose mode is enabled. Routed to stderr in --fingerprint mode to keep stdout clean."""
     if VERBOSE:
@@ -64,7 +74,24 @@ def status_print(*args, **kwargs):
     print(*args, **kwargs)
 
 
-def get_bytes_from_url(url: str, timeout: int = 10, max_size: int = 1024 * 1024) -> bytes:
+class CheckedRedirectHandler(HTTPRedirectHandler):
+    """Re-check every redirect hop: urllib follows redirects itself, so validating only the first URL is not enough."""
+
+    def __init__(self, validate_url: Callable[[str], None] | None):
+        self.validate_url = validate_url
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urlparse(newurl).scheme != urlparse(req.full_url).scheme:
+            raise CryptoCliException(f"URL redirected to different scheme: {req.full_url} -> {newurl}")
+        if self.validate_url is not None:
+            self.validate_url(newurl)
+        vprint(f"{Color.DIM.value}Redirected to: {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def get_bytes_from_url(
+    url: str, timeout: int = 10, max_size: int = 1024 * 1024, validate_url: Callable[[str], None] | None = None
+) -> bytes:
     """
     Fetch bytes from URL with security validations.
 
@@ -72,45 +99,48 @@ def get_bytes_from_url(url: str, timeout: int = 10, max_size: int = 1024 * 1024)
         url: URL to fetch
         timeout: Request timeout in seconds
         max_size: Maximum allowed response size in bytes
+        validate_url: Optional check applied to the initial URL and to every redirect target; raises to refuse
     """
-    from urllib.parse import urlparse
-
-    # Validate URL scheme and prevent redirects to suspicious protocols
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         raise CryptoCliException(f"Invalid URL scheme: {parsed.scheme}")
+    if validate_url is not None:
+        validate_url(url)
 
     try:
-        response = urlopen(url, timeout=timeout)
-
-        # Check for excessive redirects or redirect to different scheme
-        if response.url != url:
-            redirect_parsed = urlparse(response.url)
-            if redirect_parsed.scheme != parsed.scheme:
-                raise CryptoCliException(f"URL redirected to different scheme: {url} -> {response.url}")
-            vprint(f"{Color.DIM.value}Redirected to: {response.url}")
-
-        # Read with size limit to prevent memory exhaustion
-        data = response.read(max_size + 1)
-        if len(data) > max_size:
-            raise CryptoCliException(f"Response too large (>{max_size} bytes)")
-
-    except URLError as e:
+        with build_opener(CheckedRedirectHandler(validate_url)).open(url, timeout=timeout) as response:
+            status = response.status
+            # Read with size limit to prevent memory exhaustion
+            data = response.read(max_size + 1)
+    except (OSError, HTTPException) as e:  # URLError, timeouts, resets, truncated or malformed responses
         raise CryptoCliException(f"Unable to reach {url}") from e
 
-    if response.status != 200:
+    if status != 200:
         raise CryptoCliException(f"Unable to reach {url}")
+    if len(data) > max_size:
+        raise CryptoCliException(f"Response too large (>{max_size} bytes)")
 
     return data
 
 
 def write_to_file(obj: Any, filename: str) -> None:
+    filepath = SHARE_PATH / filename
     try:
         SHARE_PATH.mkdir(parents=True, exist_ok=True)
-        filepath = SHARE_PATH / filename
-        mode = "wb" if isinstance(obj, bytes) else "w"
-        with filepath.open(mode) as file:
-            file.write(str(obj) if not isinstance(obj, bytes) else obj)
+        data = obj if isinstance(obj, bytes) else str(obj).encode()
+        # Atomic write: temp file in the same directory, then rename over the destination
+        temp_fd, temp_name = tempfile.mkstemp(dir=SHARE_PATH, prefix=f".{filename}.")
+        temp_path = Path(temp_name)
+        try:
+            try:
+                os.write(temp_fd, data)
+            finally:
+                os.close(temp_fd)
+            temp_path.chmod(0o644)  # mkstemp creates 0o600; the CA bundle is public
+            temp_path.replace(filepath)
+        except BaseException:
+            temp_path.unlink(missing_ok=True)
+            raise
     except (OSError, TypeError) as exc:
         raise CryptoCliException(f"Failed to write to file {filepath}") from exc
 
@@ -123,7 +153,8 @@ def validate_aia_url(url: str) -> None:
     We resolve the hostname and require *every* resolved address to be globally
     routable. ipaddress.is_global rejects private (RFC 1918 / RFC 4193), loopback,
     link-local (including the 169.254.169.254 cloud-metadata endpoint) and reserved
-    ranges in a single allowlist-style check.
+    ranges in a single allowlist-style check. get_certificate_from_url applies this
+    to the AIA URL and to every redirect hop.
 
     Residual risk: urlopen re-resolves the hostname when it connects, so a fast-
     flipping DNS record could rebind to a private address between this check and the
@@ -138,17 +169,20 @@ def validate_aia_url(url: str) -> None:
     """
     from ipaddress import ip_address
     from socket import getaddrinfo
-    from urllib.parse import urlparse
 
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         raise CryptoCliException(f"AIA URL has invalid scheme: {parsed.scheme}")
     if not parsed.hostname:
         raise CryptoCliException(f"AIA URL has no hostname: {url}")
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError as exc:
+        raise CryptoCliException(f"AIA URL has invalid port: {url}") from exc
 
     try:
-        infos = getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
-    except OSError as exc:
+        infos = getaddrinfo(parsed.hostname, port)
+    except (OSError, UnicodeError) as exc:
         raise CryptoCliException(f"AIA URL host does not resolve: {parsed.hostname}") from exc
 
     for addr in {info[4][0] for info in infos}:
@@ -160,9 +194,12 @@ def validate_aia_url(url: str) -> None:
 
 
 def get_certificate_from_url(url: str) -> X509Certificate:
-    """Fetch and parse certificate from URL, with SSRF protection."""
-    validate_aia_url(url)
-    return load_pem_x509_certificate(DER_cert_to_PEM_cert(get_bytes_from_url(url)).encode("ascii"))
+    """Fetch and parse certificate from URL, with SSRF protection on the URL and on every redirect hop."""
+    data = get_bytes_from_url(url, validate_url=validate_aia_url)
+    try:
+        return load_pem_x509_certificate(DER_cert_to_PEM_cert(data).encode("ascii"))
+    except ValueError as exc:
+        raise CryptoCliException(f"AIA URL did not return a DER certificate: {url}") from exc
 
 
 def get_ca_cert_pem() -> None:
@@ -175,7 +212,10 @@ def get_hostname_and_port(host):
         host_port = host.split(":") if ":" in host else (host, 443)
         if len(host_port) != 2:
             raise ValueError("Invalid host format")
-        return host_port[0], int(host_port[1])
+        hostname, port = host_port[0], int(host_port[1])
+        if not hostname or not 0 < port < 65536:
+            raise ValueError("Invalid host format")
+        return hostname, port
     except (ValueError, IndexError) as exc:
         raise CryptoCliException(f"Unable to parse host: {host}") from exc
 
@@ -194,7 +234,15 @@ def get_certificate_from_hostname_and_port(hostname, port, timeout: int | None =
     except SSLCertVerificationError as exc:
         raise CryptoCliException(f"Cert verification error: {hostname}:{port}") from exc
     except ConnectionRefusedError as exc:
-        raise CryptoCliException(f"Connection refused: {hostname}:{port}") from exc
+        raise CryptoCliNetworkException(f"Connection refused: {hostname}:{port}") from exc
+    except TimeoutError as exc:
+        raise CryptoCliNetworkException(f"Connection timed out: {hostname}:{port}") from exc
+    except gaierror as exc:
+        raise CryptoCliNetworkException(f"Unable to resolve host: {hostname}") from exc
+    except UnicodeError as exc:  # hostname that cannot be IDNA-encoded
+        raise CryptoCliNetworkException(f"Invalid hostname: {hostname}") from exc
+    except OSError as exc:  # unreachable network, reset, TLS handshake failure other than cert verification...
+        raise CryptoCliNetworkException(f"Connection error: {hostname}:{port} ({exc})") from exc
 
 
 def get_cert_extension_or_none(
@@ -217,8 +265,12 @@ def verify_certificate_signature(cert: X509Certificate, issuer_cert: X509Certifi
     """
     try:
         issuer_public_key = issuer_cert.public_key()
-        signature_hash_algorithm = cert.signature_hash_algorithm
+        if isinstance(issuer_public_key, ed25519.Ed25519PublicKey | ed448.Ed448PublicKey):
+            # EdDSA has no separate hash algorithm (signature_hash_algorithm is None): handle it before the hash check
+            issuer_public_key.verify(cert.signature, cert.tbs_certificate_bytes)
+            return
 
+        signature_hash_algorithm = cert.signature_hash_algorithm
         if signature_hash_algorithm is None:
             raise CryptoCliException("Certificate uses unsupported signature algorithm (no hash)")
 
@@ -242,12 +294,6 @@ def verify_certificate_signature(cert: X509Certificate, issuer_cert: X509Certifi
                 cert.tbs_certificate_bytes,
                 signature_hash_algorithm,
             )
-        elif isinstance(issuer_public_key, ed25519.Ed25519PublicKey | ed448.Ed448PublicKey):
-            # EdDSA doesn't use a separate hash algorithm
-            issuer_public_key.verify(
-                cert.signature,
-                cert.tbs_certificate_bytes,
-            )
         else:
             raise CryptoCliException(f"Unsupported public key type: {type(issuer_public_key).__name__}")
 
@@ -268,6 +314,25 @@ def check_certificate_validity(cert: X509Certificate) -> None:
     if now > cert.not_valid_after_utc:
         raise CryptoCliException(f"Certificate expired (expired on {cert.not_valid_after_utc})")
     vprint(f"Certificate valid: {cert.not_valid_before_utc} to {cert.not_valid_after_utc}")
+
+
+def check_issuer_constraints(issuer_cert: X509Certificate, intermediates_below: int) -> None:
+    """
+    Check that issuer_cert is allowed to sign other certificates (RFC 5280 4.2.1.9 and 4.2.1.3).
+    Without this, the holder of any valid leaf certificate could act as a CA and issue for any hostname.
+    intermediates_below is the number of intermediate CA certificates between issuer_cert and the leaf.
+    Raises CryptoCliException if issuer_cert may not act as the issuer at that position.
+    """
+    name = issuer_cert.subject.rfc4514_string()
+    basic_constraints = get_cert_extension_or_none(issuer_cert, ExtensionOID.BASIC_CONSTRAINTS)
+    if basic_constraints is None or not basic_constraints.value.ca:
+        raise CryptoCliException(f"Issuer certificate is not a CA (basicConstraints): {name}")
+    path_length = basic_constraints.value.path_length
+    if path_length is not None and intermediates_below > path_length:
+        raise CryptoCliException(f"Issuer certificate path length constraint exceeded: {name}")
+    key_usage = get_cert_extension_or_none(issuer_cert, ExtensionOID.KEY_USAGE)
+    if key_usage is not None and not key_usage.value.key_cert_sign:
+        raise CryptoCliException(f"Issuer certificate may not sign certificates (keyUsage): {name}")
 
 
 def verify_hostname(cert: X509Certificate, hostname: str) -> None:
@@ -330,23 +395,33 @@ def _match_hostname(hostname: str, cert_name: str) -> bool:
     return False
 
 
-def load_cacerts(filename: str) -> dict[str, str]:
+def load_cacerts(filename: str) -> dict[str, X509Certificate]:
+    parse_error = "cacert.pem could not be parsed: refresh it with 'crypto get-cacert'"
     try:
-        with Path(filename).open() as file:
+        with Path(filename).open(encoding="utf-8") as file:
             lines = [line.strip("\n").strip("\r") for line in file]
     except FileNotFoundError as exc:
         raise CryptoCliException("cacert.pem not found: get it with 'crypto get-cacert'") from exc
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CryptoCliException("cacert.pem could not be read") from exc
     begins = [i for i, line in enumerate(lines) if line.startswith("-----BEGIN CERTIFICATE-----")]
     ends = [i for i, line in enumerate(lines) if line.startswith("-----END CERTIFICATE-----")]
-    if len(begins) != len(ends) or begins[0] < 2 or any(a >= b for a, b in zip(begins, ends, strict=True)):
-        raise CryptoCliException("cacert.pem could not be parsed")
-    if any(not lines[i - 1].startswith("=====") for i in begins):
-        raise CryptoCliException("cacert.pem could not be parsed")
-    certs = {
-        lines[b - 2]: "\n".join(lines[i] for i in range(b, e + 1)) + "\n" for b, e in zip(begins, ends, strict=True)
-    }
+    if not begins or len(begins) != len(ends) or any(a >= b for a, b in zip(begins, ends, strict=True)):
+        raise CryptoCliException(parse_error)
+    certs = {}
+    for begin, end in zip(begins, ends, strict=True):
+        # Layout: name, "=====" underline, optional "# ..." comment lines (newer bundles add a fingerprint), then BEGIN
+        underline = begin - 1
+        while underline > 0 and lines[underline].startswith("#"):
+            underline -= 1
+        if underline < 1 or not lines[underline].startswith("====="):
+            raise CryptoCliException(parse_error)
+        certs[lines[underline - 1]] = "\n".join(lines[begin : end + 1]) + "\n"
     vprint(f"{len(certs)} root CAs loaded from cacert.pem")
-    return {name: load_pem_x509_certificate(cert.encode()) for name, cert in certs.items()}
+    try:
+        return {name: load_pem_x509_certificate(cert.encode()) for name, cert in certs.items()}
+    except ValueError as exc:
+        raise CryptoCliException(parse_error) from exc
 
 
 class CertStore:
@@ -389,6 +464,8 @@ class CertStore:
             if ski is None:
                 continue  # Skip certs without SKI when looking for a match
             if ski.value.digest.hex() == cert_aki_value.hex():
+                # The root itself must be within its validity period (the other root paths already check this)
+                check_certificate_validity(cert)
                 # Verify this certificate was signed by the root CA
                 verify_certificate_signature(ssl_certificate, cert)
                 # Verify root CA self-signature
@@ -482,6 +559,9 @@ class CertStore:
             for item in aia_uri_list:
                 vprint(f"{Color.DIM.value}Fetching issuer from: {item}")
                 next_cert = get_certificate_from_url(item)
+                # The fetched issuer is untrusted input: it must be a CA allowed to sign at this position.
+                # (Roots from cacert.pem are trust anchors, trusted a priori, so they are not subject to this.)
+                check_issuer_constraints(next_cert, depth)
                 # Verify this certificate was signed by the next one in the chain
                 verify_certificate_signature(ssl_certificate, next_cert)
                 vprint(
@@ -587,6 +667,8 @@ def main():
             if args.fingerprint:
                 print(certificate.fingerprint(hashes.SHA256()).hex())
             return 0
+        except CryptoCliNetworkException:
+            raise  # No verdict was reached: never counts as an expected verification failure
         except CryptoCliException as e:
             if args.expect_fail:
                 vprint(f"Verification failed as expected: {e}")
