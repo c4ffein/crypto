@@ -182,12 +182,15 @@ tls-pin-get api.anthropic.com                # one fingerprint per line
 ```
 
 What it runs comes from `~/.config/crypto/tls-pin-update.json` (or from its arguments: `tls-pin-update.py cat
-some-pins.json`). It is an argv, never a shell line. Without that file, it is the `FETCH` at the top of the script;
-a file that is there but is not exactly this is an error, and nothing is run then.
+some-pins.json`). There is no default: without that file, or with one that is not exactly this, it is an error and
+nothing is run.
 
 ```json
-{"fetch": ["ssh", "user@server", "docker", "exec", "cctl-svc-crypto", "cat", "/data/crypto/pins.json"]}
+{"fetch": ["/usr/bin/ssh", "user@server", "docker", "exec", "cctl-svc-crypto", "cat", "/data/crypto/pins.json"]}
 ```
+
+It is a list of arguments, run without a shell on this machine. A full path for `ssh` is not looked up in `PATH`.
+What follows the server name is another matter: ssh joins it and gives it to your shell on the server.
 
 ## What it does
 

@@ -21,9 +21,11 @@ Usage: tls-pin-update.py                (runs the configured command)
        tls-pin-update.py command ...    (runs that instead: anything that prints the pins.json)
 
 The configured command is the `fetch` of ~/.config/crypto/tls-pin-update.json (XDG_CONFIG_HOME is honoured), a
-list of arguments run as they are, without a shell:
-  {"fetch": ["ssh", "user@server", "docker", "exec", "cctl-svc-crypto", "cat", "/data/crypto/pins.json"]}
-Without that file it is FETCH, below. A file that is there and is not exactly that is an error: nothing is run.
+list of arguments run as they are, without a shell on this machine (ssh gives its own to a shell on the server):
+  {"fetch": ["/usr/bin/ssh", "user@server", "docker", "exec", "cctl-svc-crypto", "cat", "/data/crypto/pins.json"]}
+There is no default: without that file, or with one that is not exactly that, it is an error and nothing is run.
+A full path for ssh is not looked up in PATH. `docker exec` and not `cctl service script crypto pins`: a command
+given to ssh does not get the PATH of a login shell (no ~/.local/bin), nor its aliases.
 """
 
 import json
@@ -34,10 +36,10 @@ import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-# What prints the server's pins.json, when ~/.config/crypto/tls-pin-update.json does not say. `docker exec` and not
-# `cctl service script crypto pins`: a command given to ssh does not get the PATH of a login shell (no
-# ~/.local/bin), nor its aliases.
-FETCH = ["ssh", "debian@p1.c4ffein.io", "docker", "exec", "cctl-svc-crypto", "cat", "/data/crypto/pins.json"]
+# What the config file looks like: shown when there is none
+EXAMPLE = (
+    '{"fetch": ["/usr/bin/ssh", "user@server", "docker", "exec", "cctl-svc-crypto", "cat", "/data/crypto/pins.json"]}'
+)
 FETCH_TIMEOUT = 120  # seconds, a passphrase to type included
 MAX_AGE = timedelta(hours=1)  # the server collects every 5 minutes: older than this, it has stopped
 CLOCK_SKEW = timedelta(minutes=10)
@@ -161,14 +163,16 @@ def strict_json(raw: bytes) -> object:
         raise ValueError("nested too deep") from None
 
 
-def configured_fetch(path: Path) -> list[str] | None:
-    """The command of the config file, {"fetch": ["ssh", ...]}. None when there is no file. ValueError when there
-    is one that is not exactly that: a file that is there is never ignored, we do not fall back to FETCH."""
+def configured_fetch(path: Path) -> list[str]:
+    """The command of the config file, {"fetch": ["ssh", ...]}. ValueError when there is no file, or one that is
+    not exactly that: there is nothing to fall back to."""
     try:
         with path.open("rb") as file:
             raw = file.read(MAX_BYTES + 1)
     except FileNotFoundError:
-        return None
+        raise ValueError(
+            f"no such file. Create it, with what prints the pins.json of your server:\n  {EXAMPLE}"
+        ) from None
     except OSError as exc:
         raise ValueError(f"could not read it: {type(exc).__name__}") from None
     (command,) = fields(strict_json(raw), CONFIG_FIELDS, "the config")
@@ -320,7 +324,7 @@ def main(argv: list[str]) -> int:
         print(__doc__.strip())
         return 0
     try:
-        command = argv[1:] or configured_fetch(config_path()) or FETCH
+        command = argv[1:] or configured_fetch(config_path())
     except ValueError as exc:
         print(f"tls-pin-update: {config_path()}: {exc}", file=sys.stderr)
         return 1

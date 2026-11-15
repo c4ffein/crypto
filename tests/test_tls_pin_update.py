@@ -105,12 +105,10 @@ class UpdateTestCase(unittest.TestCase):
         self.config.write_bytes(content if isinstance(content, bytes) else json.dumps(content).encode())
 
     def main_without_a_command(self):
-        """Run main() here without arguments nor terminal. FETCH is replaced: the real one is an ssh to a server."""
-        default = [sys.executable, "-c", "import sys; sys.exit(42)"]
+        """Run main() here without arguments nor terminal"""
         stdout, stderr = io.StringIO(), io.StringIO()
         with (
             mock.patch.dict(os.environ, self.env),
-            mock.patch.object(self.module, "FETCH", default),
             mock.patch.object(self.module, "fetch", wraps=self.module.fetch) as fetch,
             mock.patch.object(self.module.sys, "stdin") as stdin,
             contextlib.redirect_stdout(stdout),
@@ -271,7 +269,7 @@ class TestFirstTimeAndCanary(UpdateTestCase):
 
 
 class TestConfiguredCommand(UpdateTestCase):
-    """~/.config/crypto/tls-pin-update.json: {"fetch": [...]}, in place of FETCH"""
+    """~/.config/crypto/tls-pin-update.json: {"fetch": [...]}, the command to run when none is given"""
 
     def setUp(self):
         super().setUp()
@@ -294,11 +292,24 @@ class TestConfiguredCommand(UpdateTestCase):
         self.assertEqual(self.get_pins("a.test").stdout.split(), [SHA_A])
         self.assertEqual(json.loads(self.config.read_text()), {"fetch": self.cat})  # read-only: left as it was
 
-    def test_without_a_config_file_it_is_the_default(self):
-        code, _, stderr, fetch = self.main_without_a_command()
-        fetch.assert_called_once_with([sys.executable, "-c", "import sys; sys.exit(42)"])
-        self.assertEqual(code, 1)
-        self.assertIn("failed (exit code 42)", stderr)
+    def test_without_a_config_file_nothing_is_run_and_the_file_to_create_is_shown(self):
+        before = self.snapshot()
+        code, stdout, stderr, fetch = self.main_without_a_command()
+        self.assertEqual((code, stdout), (1, ""))
+        fetch.assert_not_called()
+        self.assertIn(f"tls-pin-update: {self.config}: no such file", stderr)
+        self.assertIn(self.module.EXAMPLE, stderr)
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse(self.config.exists())  # shown, not created
+
+    def test_there_is_no_built_in_command_anymore(self):
+        self.assertFalse(hasattr(self.module, "FETCH"))
+        self.assertNotIn("c4ffein.io", SOURCE.read_text())
+
+    def test_example_is_a_valid_config(self):
+        self.configure(self.module.EXAMPLE.encode())
+        self.assertEqual(self.module.configured_fetch(self.config)[:2], ["/usr/bin/ssh", "user@server"])
+        self.assertIn(self.module.EXAMPLE, (ROOT / "README.md").read_text())
 
     def test_arguments_win_and_the_config_is_not_even_read(self):
         self.configure(b"not json")
